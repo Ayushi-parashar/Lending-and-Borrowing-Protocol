@@ -87,6 +87,7 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
     event DonationReceived(address indexed donor, uint256 amount);
     event WhitelistUpdated(address indexed user, bool status);
     event WhitelistModeUpdated(bool enabled);
+    event ProtocolFeesWithdrawn(address indexed to, uint256 amount);
 
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
@@ -137,47 +138,19 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Withdrawn(msg.sender, amountToTransfer);
     }
 
+    function emergencyWithdraw() external whenPaused nonReentrant {
+        uint256 amount = users[msg.sender].deposited;
+        require(amount > 0, "Nothing to withdraw");
+        users[msg.sender].deposited = 0;
+        totalDeposits -= amount;
+        payable(msg.sender).transfer(amount);
+        emit Withdrawn(msg.sender, amount);
+    }
+
     function donate() external payable {
         require(msg.value > 0, "Donation must be > 0");
         protocolFees += msg.value;
         emit DonationReceived(msg.sender, msg.value);
     }
 
-    function toggleWhitelistMode(bool _enabled) external onlyOwner {
-        isWhitelistEnabled = _enabled;
-        emit WhitelistModeUpdated(_enabled);
-    }
-
-    function updateWhitelist(address _user, bool _status) external onlyOwner {
-        whitelist[_user] = _status;
-        emit WhitelistUpdated(_user, _status);
-    }
-
-    function recordLoanHistory(address user, uint256 interest) internal {
-        loanHistories[user].push(LoanHistory({
-            amount: loans[user].amount,
-            interestPaid: interest,
-            duration: loans[user].duration,
-            repaidAt: block.timestamp
-        }));
-    }
-
-    function rewardPerToken() public view returns (uint256) {
-        if (totalDeposits == 0) return rewardPerTokenStored;
-        return rewardPerTokenStored + ((block.timestamp - lastUpdateTime) * rewardRate * 1e18 / totalDeposits);
-    }
-
-    function earned(address account) public view returns (uint256) {
-        return (users[account].deposited * (rewardPerToken() - userRewardPerTokenPaid[account]) / 1e18) + rewards[account];
-    }
-
-    function claimReward() external nonReentrant updateReward(msg.sender) {
-        uint256 reward = rewards[msg.sender];
-        if (reward > 0) {
-            rewards[msg.sender] = 0;
-            emit RewardClaimed(msg.sender, reward);
-        }
-    }
-
-    receive() external payable {}
-}
+    function t
