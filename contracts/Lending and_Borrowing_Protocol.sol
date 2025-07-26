@@ -20,6 +20,19 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
     uint256 public earlyWithdrawalPenalty = 2;
     uint256 public withdrawalTimelock = 7 days;
 
+    bool public borrowingPaused = false;
+    bool public lendingPaused = false;
+
+    modifier whenBorrowingNotPaused() {
+        require(!borrowingPaused, "Borrowing is paused");
+        _;
+    }
+
+    modifier whenLendingNotPaused() {
+        require(!lendingPaused, "Lending is paused");
+        _;
+    }
+
     mapping(address => uint256) public userRewardPerTokenPaid;
     mapping(address => uint256) public rewards;
     mapping(address => bool) public authorizedLiquidators;
@@ -112,7 +125,15 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         lastUpdateTime = block.timestamp;
     }
 
-    function deposit() external payable nonReentrant whenNotPaused updateReward(msg.sender) onlyWhitelisted {
+    function setBorrowingPaused(bool _paused) external onlyOwner {
+        borrowingPaused = _paused;
+    }
+
+    function setLendingPaused(bool _paused) external onlyOwner {
+        lendingPaused = _paused;
+    }
+
+    function deposit() external payable nonReentrant whenNotPaused whenLendingNotPaused updateReward(msg.sender) onlyWhitelisted {
         require(msg.value > 0, "Deposit must be > 0");
         users[msg.sender].deposited += msg.value;
         users[msg.sender].lastDepositTime = block.timestamp;
@@ -153,74 +174,83 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit DonationReceived(msg.sender, msg.value);
     }
 
-    function updateWhitelist(address user, bool status) external onlyOwner {
-        whitelist[user] = status;
-        emit WhitelistUpdated(user, status);
+    function borrow(uint256 amount, uint256 duration) external payable nonReentrant whenNotPaused whenBorrowingNotPaused updateReward(msg.sender) {
+        require(!users[msg.sender].hasActiveLoan, "Already have a loan");
+        require(msg.value > 0, "Collateral required");
+        require(amount > 0, "Invalid borrow amount");
+
+        uint256 requiredCollateral = amount.mul(COLLATERAL_RATIO).div(100);
+        require(msg.value >= requiredCollateral, "Insufficient collateral");
+
+        uint256 interestRate = getInterestRate();
+        loans[msg.sender] = Loan({
+            amount: amount,
+            collateral: msg.value,
+            timestamp: block.timestamp,
+            interestRate: interestRate,
+            duration: duration,
+            isActive: true
+        });
+
+        users[msg.sender].borrowed = amount;
+        users[msg.sender].collateralDeposited = msg.value;
+        users[msg.sender].hasActiveLoan = true;
+        totalBorrowed += amount;
+        totalCollateral += msg.value;
+
+        payable(msg.sender).transfer(amount);
+        emit Borrowed(msg.sender, amount, msg.value, duration);
     }
 
-    function toggleWhitelistMode(bool enabled) external onlyOwner {
-        isWhitelistEnabled = enabled;
-        emit WhitelistModeUpdated(enabled);
+    function repayLoan() external payable nonReentrant {
+        Loan storage loan = loans[msg.sender];
+        require(loan.isActive, "No active loan");
+
+        uint256 timeElapsed = block.timestamp.sub(loan.timestamp);
+        uint256 interest = loan.amount.mul(loan.interestRate).mul(timeElapsed).div(SECONDS_PER_YEAR).div(100);
+        uint256 totalDue = loan.amount.add(interest);
+
+        require(msg.value >= totalDue, "Insufficient repayment");
+        uint256 excess = msg.value.sub(totalDue);
+        if (excess > 0) payable(msg.sender).transfer(excess);
+
+        protocolFees += interest;
+        users[msg.sender].borrowed = 0;
+        users[msg.sender].hasActiveLoan = false;
+        totalBorrowed -= loan.amount;
+        uint256 collateral = loan.collateral;
+        totalCollateral -= collateral;
+        loan.isActive = false;
+
+        loanHistories[msg.sender].push(LoanHistory(loan.amount, interest, loan.duration, block.timestamp));
+        delete loans[msg.sender];
+
+        payable(msg.sender).transfer(collateral);
+        emit Repaid(msg.sender, loan.amount, interest);
     }
 
-    function withdrawProtocolFees(address payable to) external onlyOwner {
-        require(protocolFees > 0, "No fees available");
-        uint256 amount = protocolFees;
-        protocolFees = 0;
-        to.transfer(amount);
-        emit ProtocolFeesWithdrawn(to, amount);
+    function liquidate(address borrower) external nonReentrant {
+        require(authorizedLiquidators[msg.sender], "Not authorized");
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+
+        uint256 collateralValue = loan.collateral;
+        uint256 requiredCollateral = loan.amount.mul(LIQUIDATION_THRESHOLD).div(100);
+        require(collateralValue < requiredCollateral, "Loan is safe");
+
+        loan.isActive = false;
+        users[borrower].hasActiveLoan = false;
+        totalBorrowed -= loan.amount;
+        totalCollateral -= collateralValue;
+
+        uint256 bonus = collateralValue.mul(LIQUIDATION_BONUS).div(100);
+        uint256 reward = collateralValue.sub(bonus);
+
+        payable(msg.sender).transfer(bonus);
+        protocolFees += reward;
+        emit Liquidated(borrower, collateralValue, loan.amount, msg.sender);
     }
 
-    function claimReward() external updateReward(msg.sender) nonReentrant {
-        uint256 reward = rewards[msg.sender];
-        require(reward > 0, "No rewards to claim");
-        rewards[msg.sender] = 0;
-        payable(msg.sender).transfer(reward);
-        emit RewardClaimed(msg.sender, reward);
-    }
-
-    function flashLoan(uint256 amount, address receiver, bytes calldata params) external nonReentrant {
-        require(amount <= address(this).balance, "Insufficient liquidity");
-
-        uint256 fee = amount.mul(flashLoanFee).div(10000);
-        uint256 balanceBefore = address(this).balance;
-
-        IFlashLoanReceiver(receiver).executeOperation{value: amount}(amount, params);
-
-        require(address(this).balance >= balanceBefore + fee, "Flash loan not repaid with fee");
-        protocolFees += fee;
-
-        emit FlashLoan(receiver, amount, fee);
-    }
-
-    function extendLoan(uint256 additionalTime) external nonReentrant {
-        require(loans[msg.sender].isActive, "No active loan");
-        require(additionalTime > 0, "Invalid extension time");
-        require(loans[msg.sender].duration + additionalTime <= MAX_LOAN_DURATION, "Exceeds max loan duration");
-
-        loans[msg.sender].duration += additionalTime;
-        emit LoanExtended(msg.sender, loans[msg.sender].duration);
-    }
-
-    function repayPartialLoan(uint256 amount) external payable nonReentrant {
-        require(loans[msg.sender].isActive, "No active loan");
-        require(amount > 0 && amount <= loans[msg.sender].amount, "Invalid repayment amount");
-        require(msg.value == amount, "Incorrect ETH amount sent");
-
-        loans[msg.sender].amount -= amount;
-        users[msg.sender].borrowed -= amount;
-        totalBorrowed -= amount;
-
-        emit PartialRepayment(msg.sender, amount);
-
-        if (loans[msg.sender].amount == 0) {
-            loans[msg.sender].isActive = false;
-            users[msg.sender].hasActiveLoan = false;
-            emit Repaid(msg.sender, amount, 0); // Optional: calculate and emit interest
-        }
-    }
-
-    // Dummy reward functions for completeness
     function rewardPerToken() public view returns (uint256) {
         if (totalDeposits == 0) return rewardPerTokenStored;
         return rewardPerTokenStored.add((block.timestamp.sub(lastUpdateTime)).mul(rewardRate).mul(1e18).div(totalDeposits));
@@ -228,5 +258,15 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
 
     function earned(address account) public view returns (uint256) {
         return users[account].deposited.mul(rewardPerToken().sub(userRewardPerTokenPaid[account])).div(1e18).add(rewards[account]);
+    }
+
+    function getInterestRate() public view returns (uint256) {
+        uint256 utilization = totalBorrowed.mul(100).div(totalDeposits == 0 ? 1 : totalDeposits);
+        for (uint256 i = 0; i < interestTiers.length; i++) {
+            if (utilization <= interestTiers[i].utilizationThreshold) {
+                return interestTiers[i].interestRate;
+            }
+        }
+        return baseInterestRate;
     }
 }
