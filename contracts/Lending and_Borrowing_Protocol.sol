@@ -229,6 +229,60 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Repaid(msg.sender, loan.amount, interest);
     }
 
+    function partialRepayLoan(uint256 repayAmount) external payable nonReentrant {
+        Loan storage loan = loans[msg.sender];
+        require(loan.isActive, "No active loan");
+        require(repayAmount > 0 && repayAmount <= loan.amount, "Invalid repay amount");
+
+        uint256 timeElapsed = block.timestamp.sub(loan.timestamp);
+        uint256 interest = loan.amount.mul(loan.interestRate).mul(timeElapsed).div(SECONDS_PER_YEAR).div(100);
+        uint256 totalDue = repayAmount.add(interest.mul(repayAmount).div(loan.amount));
+
+        require(msg.value >= totalDue, "Insufficient repayment");
+
+        loan.amount = loan.amount.sub(repayAmount);
+        users[msg.sender].borrowed = loan.amount;
+        totalBorrowed = totalBorrowed.sub(repayAmount);
+        protocolFees = protocolFees.add(interest.mul(repayAmount).div(loan.amount));
+
+        emit PartialRepayment(msg.sender, repayAmount);
+    }
+
+    function extendLoan(uint256 additionalTime) external {
+        Loan storage loan = loans[msg.sender];
+        require(loan.isActive, "No active loan");
+        require(loan.duration + additionalTime <= MAX_LOAN_DURATION, "Exceeds max duration");
+
+        loan.duration += additionalTime;
+        emit LoanExtended(msg.sender, loan.duration);
+    }
+
+    function claimRewards() external nonReentrant updateReward(msg.sender) {
+        uint256 reward = rewards[msg.sender];
+        require(reward > 0, "No rewards");
+        rewards[msg.sender] = 0;
+        payable(msg.sender).transfer(reward);
+        emit RewardClaimed(msg.sender, reward);
+    }
+
+    function withdrawProtocolFees(address payable to) external onlyOwner {
+        require(protocolFees > 0, "No fees");
+        uint256 amount = protocolFees;
+        protocolFees = 0;
+        to.transfer(amount);
+        emit ProtocolFeesWithdrawn(to, amount);
+    }
+
+    function updateWhitelist(address user, bool status) external onlyOwner {
+        whitelist[user] = status;
+        emit WhitelistUpdated(user, status);
+    }
+
+    function toggleWhitelistMode(bool enabled) external onlyOwner {
+        isWhitelistEnabled = enabled;
+        emit WhitelistModeUpdated(enabled);
+    }
+
     function liquidate(address borrower) external nonReentrant {
         require(authorizedLiquidators[msg.sender], "Not authorized");
         Loan storage loan = loans[borrower];
