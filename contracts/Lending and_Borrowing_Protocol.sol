@@ -103,6 +103,10 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
     event WhitelistModeUpdated(bool enabled);
     event ProtocolFeesWithdrawn(address indexed to, uint256 amount);
     event BlacklistUpdated(address indexed user, bool status);
+    event LendingPaused(bool status);
+    event BorrowingPaused(bool status);
+    event RewardRateUpdated(uint256 newRate);
+    event EmergencyWithdrawal(address indexed to, uint256 amount);
 
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
@@ -132,7 +136,7 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         lastUpdateTime = block.timestamp;
     }
 
-    // Add new functions below (see previous message for suggestions)
+    // 🔹 Functionality: Get Loan Health
     function getLoanHealth(address user) external view returns (uint256 ltv, bool isLiquidationRisk) {
         Loan storage loan = loans[user];
         if (!loan.isActive || loan.amount == 0) return (0, false);
@@ -140,10 +144,12 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         isLiquidationRisk = ltv >= LIQUIDATION_THRESHOLD;
     }
 
+    // 🔹 Functionality: Get TVL
     function getTVL() external view returns (uint256) {
         return address(this).balance;
     }
 
+    // 🔹 Functionality: Claim and Reinvest Rewards
     function claimAndDepositRewards() external nonReentrant updateReward(msg.sender) {
         uint256 reward = rewards[msg.sender];
         require(reward > 0, "No rewards");
@@ -153,6 +159,7 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Deposited(msg.sender, reward);
     }
 
+    // 🔹 Functionality: Refinance Existing Loan
     function refinanceLoan(uint256 newAmount, uint256 newDuration) external nonReentrant {
         Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No active loan");
@@ -164,11 +171,13 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         loan.interestRate = newRate;
     }
 
+    // 🔹 Functionality: Update Blacklist
     function updateBlacklist(address user, bool status) external onlyOwner {
         blacklist[user] = status;
         emit BlacklistUpdated(user, status);
     }
 
+    // 🔹 Functionality: Execute Flash Loan
     function executeFlashLoan(uint256 amount, address receiver, bytes calldata params) external nonReentrant whenNotPaused {
         require(amount <= address(this).balance, "Insufficient liquidity");
         uint256 fee = amount.mul(flashLoanFee).div(1000);
@@ -179,5 +188,80 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit FlashLoan(receiver, amount, fee);
     }
 
-    // Existing core methods like deposit(), borrow(), repayLoan(), etc. stay unchanged, and will work with added modifiers as needed.
+    // 🔹 New Function: Set Lending Pause
+    function setLendingPaused(bool _paused) external onlyOwner {
+        lendingPaused = _paused;
+        emit LendingPaused(_paused);
+    }
+
+    // 🔹 New Function: Set Borrowing Pause
+    function setBorrowingPaused(bool _paused) external onlyOwner {
+        borrowingPaused = _paused;
+        emit BorrowingPaused(_paused);
+    }
+
+    // 🔹 New Function: Top-up Collateral
+    function topUpCollateral() external payable {
+        require(loans[msg.sender].isActive, "No active loan");
+        users[msg.sender].collateralDeposited += msg.value;
+        loans[msg.sender].collateral += msg.value;
+        totalCollateral += msg.value;
+        emit CollateralAdded(msg.sender, msg.value);
+    }
+
+    // 🔹 New Function: Update Reward Rate
+    function setRewardRate(uint256 newRate) external onlyOwner {
+        rewardRate = newRate;
+        emit RewardRateUpdated(newRate);
+    }
+
+    // 🔹 New Function: Donate ETH to Protocol
+    function donateToProtocol() external payable {
+        require(msg.value > 0, "Zero donation");
+        emit DonationReceived(msg.sender, msg.value);
+    }
+
+    // 🔹 New Function: Emergency Withdrawal by Owner
+    function emergencyWithdraw(address to) external onlyOwner whenPaused {
+        require(to != address(0), "Invalid address");
+        uint256 amount = address(this).balance;
+        require(amount > 0, "No funds available");
+        payable(to).transfer(amount);
+        emit EmergencyWithdrawal(to, amount);
+    }
+
+    // Optional: receive() fallback to accept ETH directly
+    receive() external payable {
+        emit DonationReceived(msg.sender, msg.value);
+    }
+
+    // Placeholder: Add your core deposit(), withdraw(), borrow(), repayLoan() functions as needed.
+
+    // 🔹 Reward Calculation Utilities
+    function rewardPerToken() public view returns (uint256) {
+        if (totalDeposits == 0) return rewardPerTokenStored;
+        return
+            rewardPerTokenStored.add(
+                rewardRate.mul(block.timestamp.sub(lastUpdateTime)).mul(1e18).div(totalDeposits)
+            );
+    }
+
+    function earned(address account) public view returns (uint256) {
+        return
+            users[account].deposited
+                .mul(rewardPerToken().sub(userRewardPerTokenPaid[account]))
+                .div(1e18)
+                .add(rewards[account]);
+    }
+
+    function getInterestRate() public view returns (uint256) {
+        if (totalDeposits == 0) return baseInterestRate;
+        uint256 utilization = totalBorrowed.mul(100).div(totalDeposits);
+        for (uint256 i = 0; i < interestTiers.length; i++) {
+            if (utilization <= interestTiers[i].utilizationThreshold) {
+                return interestTiers[i].interestRate;
+            }
+        }
+        return interestTiers[interestTiers.length - 1].interestRate;
+    }
 }
