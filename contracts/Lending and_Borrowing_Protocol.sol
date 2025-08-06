@@ -88,6 +88,7 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
     event RewardClaimed(address indexed user, uint256 amount);
     event ProtocolFeesWithdrawn(address indexed to, uint256 amount);
     event WhitelistModeUpdated(bool enabled);
+    event Liquidated(address indexed borrower, address indexed liquidator, uint256 seizedCollateral);
 
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
@@ -127,7 +128,6 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         lastUpdateTime = block.timestamp;
     }
 
-    // 🔹 Deposit ETH
     function deposit() external payable updateReward(msg.sender) nonReentrant whenLendingNotPaused notBlacklisted {
         require(msg.value > 0, "Zero deposit");
         users[msg.sender].deposited += msg.value;
@@ -136,8 +136,7 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Deposited(msg.sender, msg.value);
     }
 
-    // 🔹 Withdraw ETH
-    function withdraw(uint256 amount) external updateReward(msg.sender) nonReentrant notBlacklisted {
+    function withdraw(uint256 amount) public updateReward(msg.sender) nonReentrant notBlacklisted {
         require(amount > 0, "Zero withdraw");
         User storage user = users[msg.sender];
         require(user.deposited >= amount, "Insufficient balance");
@@ -154,12 +153,10 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Withdrawn(msg.sender, amount);
     }
 
-    // 🔹 Partial Withdraw
     function partialWithdraw(uint256 amount) external {
-        withdraw(amount); // same as normal withdraw but encourages usage
+        withdraw(amount);
     }
 
-    // 🔹 Borrow
     function borrow(uint256 amount, uint256 duration) external payable updateReward(msg.sender) nonReentrant whenBorrowingNotPaused notBlacklisted {
         require(!users[msg.sender].hasActiveLoan, "Loan exists");
         require(amount > 0 && msg.value > 0, "Invalid input");
@@ -182,7 +179,6 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Borrowed(msg.sender, amount, msg.value, duration);
     }
 
-    // 🔹 Repay full loan
     function repayLoan() external payable updateReward(msg.sender) nonReentrant {
         Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No active loan");
@@ -215,7 +211,6 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Repaid(msg.sender, loan.amount, interest);
     }
 
-    // 🔹 Partial Repay
     function partialRepay(uint256 amount) external payable nonReentrant updateReward(msg.sender) {
         Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No loan");
@@ -234,14 +229,12 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit PartialRepayment(msg.sender, amount);
     }
 
-    // 🔹 Extend loan
     function extendLoan(uint256 extraTime) external {
         require(loans[msg.sender].isActive, "No loan");
         loans[msg.sender].duration += extraTime;
         emit LoanExtended(msg.sender, loans[msg.sender].duration);
     }
 
-    // 🔹 Auto compound rewards
     function autoCompoundRewards() external updateReward(msg.sender) {
         uint256 reward = rewards[msg.sender];
         require(reward > 0, "No rewards");
@@ -251,7 +244,6 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit Deposited(msg.sender, reward);
     }
 
-    // 🔹 Admin: withdraw protocol fees
     function adminWithdrawFees(address to) external onlyOwner {
         require(to != address(0), "Invalid address");
         require(protocolFees > 0, "No fees");
@@ -261,13 +253,11 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         emit ProtocolFeesWithdrawn(to, amount);
     }
 
-    // 🔹 Admin: toggle whitelist
     function toggleWhitelistMode(bool status) external onlyOwner {
         isWhitelistEnabled = status;
         emit WhitelistModeUpdated(status);
     }
 
-    // 🔹 View rewards
     function rewardPerToken() public view returns (uint256) {
         if (totalDeposits == 0) return rewardPerTokenStored;
         return rewardPerTokenStored.add(rewardRate.mul(block.timestamp.sub(lastUpdateTime)).mul(1e18).div(totalDeposits));
@@ -288,12 +278,10 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         return interestTiers[interestTiers.length - 1].interestRate;
     }
 
-    // 🔹 View: User info
     function getUserDetails(address userAddr) external view returns (User memory, Loan memory, uint256 earnedRewards) {
         return (users[userAddr], loans[userAddr], earned(userAddr));
     }
 
-    // 🔹 View: Protocol stats
     function getProtocolStats() external view returns (
         uint256 deposits,
         uint256 borrowed,
@@ -303,7 +291,76 @@ contract EnhancedProjectV2 is ReentrancyGuard, Ownable, Pausable {
         return (totalDeposits, totalBorrowed, protocolFees, totalCollateral);
     }
 
-    // 🔹 Fallback
+    function receiveFlashLoan(address receiver, uint256 amount, bytes calldata data) external nonReentrant {
+        require(address(this).balance >= amount, "Insufficient balance");
+        uint256 fee = amount.mul(flashLoanFee).div(10000);
+        uint256 initialBalance = address(this).balance;
+
+        IFlashLoanReceiver(receiver).executeOperation(amount, data);
+        require(address(this).balance >= initialBalance + fee, "Loan not repaid");
+
+        protocolFees += fee;
+        emit FlashLoan(receiver, amount, fee);
+    }
+
+    function liquidate(address borrower) external nonReentrant {
+        require(authorizedLiquidators[msg.sender] || msg.sender == owner(), "Not authorized");
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+
+        uint256 ratio = loan.collateral.mul(100).div(loan.amount);
+        require(ratio < LIQUIDATION_THRESHOLD, "Healthy position");
+
+        uint256 bonus = loan.collateral.mul(LIQUIDATION_BONUS).div(100);
+        uint256 toLiquidator = loan.collateral.sub(bonus);
+
+        users[borrower].borrowed = 0;
+        users[borrower].collateralDeposited = 0;
+        users[borrower].hasActiveLoan = false;
+
+        loan.isActive = false;
+        totalBorrowed -= loan.amount;
+        totalCollateral -= loan.collateral;
+
+        protocolFees += bonus;
+        payable(msg.sender).transfer(toLiquidator);
+        emit Liquidated(borrower, msg.sender, toLiquidator);
+    }
+
+    function updateWhitelist(address user, bool status) external onlyOwner {
+        whitelist[user] = status;
+    }
+
+    function updateBlacklist(address user, bool status) external onlyOwner {
+        blacklist[user] = status;
+    }
+
+    function pauseLending(bool status) external onlyOwner {
+        lendingPaused = status;
+    }
+
+    function pauseBorrowing(bool status) external onlyOwner {
+        borrowingPaused = status;
+    }
+
+    function setBaseInterestRate(uint256 newRate) external onlyOwner {
+        baseInterestRate = newRate;
+    }
+
+    function setFlashLoanFee(uint256 newFee) external onlyOwner {
+        flashLoanFee = newFee;
+    }
+
+    function emergencyWithdraw() external nonReentrant {
+        require(paused(), "Not emergency");
+        User storage user = users[msg.sender];
+        uint256 amount = user.deposited;
+        require(amount > 0, "Nothing to withdraw");
+        user.deposited = 0;
+        totalDeposits -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+
     receive() external payable {
         emit Deposited(msg.sender, msg.value);
     }
