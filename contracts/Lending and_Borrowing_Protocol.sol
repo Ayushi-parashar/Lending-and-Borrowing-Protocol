@@ -2,43 +2,51 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
 /**
- * EnhancedProjectV3
+ * EnhancedProjectV3 (upgraded)
  *
- * Features:
+ * Additions:
+ * - Utilization-based dynamic interest rate (getDynamicInterestRate)
+ * - View pending interest (getPendingInterest)
+ * - Partial repayments with explicit amount (repayPartial)
+ * - Emergency collateral withdrawal when no active loan (emergencyWithdrawCollateral)
+ * - Owner-only protocol reserve withdrawal (Ownable)
+ *
+ * Existing:
  * - Collateral deposit / withdraw (with 1 hour cooldown on collateral added)
- * - Borrowing (requires collateral ratio)
- * - Interest accrual (simple interest, accrued continuously)
- * - Repayments (repay interest first, then principal)
- * - Liquidation by third parties if health factor < LIQUIDATION_THRESHOLD
- * - Protocol reserve which receives a fraction of accrued interest and liquidated collateral
- * - Helper view functions for portfolio and health
- *
- * Notes:
- * - Contract holds ETH deposited as collateral, which is used/referenced for loans.
- * - Borrow sends ETH from contract to borrower (so contract needs collateral balance from deposits).
+ * - Borrowing with collateral ratio check
+ * - Interest accrual (simple)
+ * - Repayments (interest first, then principal)
+ * - Liquidation with bonus
+ * - Protocol reserve receiving a fee cut of interest + liquidated collateral
+ * - Portfolio & health helpers
  */
-contract EnhancedProjectV3 is ReentrancyGuard {
+contract EnhancedProjectV3 is ReentrancyGuard, Ownable {
     using SafeMath for uint256;
 
     // --- Parameters ---
     uint256 public constant COLLATERAL_RATIO = 150; // 150% required (collateral / debt * 100)
-    uint256 public constant LIQUIDATION_THRESHOLD = 120; // 120% health -> liquidatable if < 120%
-    uint256 public constant LIQUIDATION_BONUS = 5; // 5% of collateral goes to liquidator
-    uint256 public constant INTEREST_RATE_BP = 500; // basis points annual interest (500 bp = 5% per year)
-    uint256 public constant INTEREST_FEE_BP = 1000; // fee on interest in basis points /10000 (i.e., 1000 => 10%)
+    uint256 public constant LIQUIDATION_THRESHOLD = 120; // 120% (liquidatable if < 120%)
+    uint256 public constant LIQUIDATION_BONUS = 5; // 5% of collateral to liquidator
+
+    // Base interest is no longer used directly; accrual pulls dynamic rate from utilization.
+    // Kept for reference/compatibility; can be used as a "mid" tier rate in the model.
+    uint256 public constant INTEREST_RATE_BP = 500; // 5% (basis points)
+
+    uint256 public constant INTEREST_FEE_BP = 1000; // protocol fee on interest in bp (1000 = 10%)
     uint256 public constant BP_DIVISOR = 10000;
 
     uint256 public totalCollateral;
-    uint256 public totalLoans; // sum of (principal + loanInterest) outstanding excluding protocolReserve
-    uint256 public protocolReserve; // tracked reserve (ETH value stored in contract balance)
+    uint256 public totalLoans; // principal + borrower-accrued interest (excludes protocolReserve)
+    uint256 public protocolReserve; // ETH value stored as protocol-owned funds
 
     // --- Structs ---
     struct User {
         uint256 collateralDeposited;
-        uint256 loanTaken; // principal borrowed (sum of principals)
+        uint256 loanTaken; // principal outstanding
     }
 
     struct Loan {
@@ -60,6 +68,7 @@ contract EnhancedProjectV3 is ReentrancyGuard {
     event CollateralWithdrawn(address indexed user, uint256 amount, uint256 remainingCollateral);
     event LoanLiquidated(address indexed liquidator, address indexed borrower, uint256 repaidAmount, uint256 bonusCollateral);
     event InterestAccrued(address indexed borrower, uint256 interestToLoan, uint256 feeToReserve);
+    event ProtocolReserveWithdrawn(address indexed to, uint256 amount);
 
     // --- Deposit collateral ---
     function depositCollateral() external payable nonReentrant {
@@ -84,11 +93,10 @@ contract EnhancedProjectV3 is ReentrancyGuard {
 
         // Check collateral ratio using collateral deposited vs amount (principal)
         uint256 ratio = user.collateralDeposited.mul(100).div(amount);
-        require(ratio >= COLLATERAL_RATIO, "Not enough collateral for requested loan");
+        require(ratio >= COLLATERAL_RATIO, "Not enough collateral");
 
-        // If there is already an active loan, disallow overlapping new loan creation for simplicity.
-        // (Alternatively you could allow increasing principal; left simple here.)
-        require(!loans[msg.sender].isActive, "Existing active loan - repay or manage it first");
+        // Disallow overlapping loans for simplicity
+        require(!loans[msg.sender].isActive, "Active loan exists");
 
         // Create loan
         loans[msg.sender] = Loan({
@@ -103,12 +111,45 @@ contract EnhancedProjectV3 is ReentrancyGuard {
         user.loanTaken = user.loanTaken.add(amount);
         totalLoans = totalLoans.add(amount);
 
-        // Transfer loan amount to borrower from contract balance
-        // Note: contract must hold enough ETH (it will if users deposited collateral)
+        // Send ETH to borrower
         (bool sent, ) = msg.sender.call{value: amount}("");
         require(sent, "Transfer failed");
 
         emit LoanTaken(msg.sender, amount, user.collateralDeposited);
+    }
+
+    // --- Interest model: utilization-based dynamic rate (in basis points) ---
+    // Utilization = totalLoans / totalCollateral (scaled to %)
+    // You can tweak thresholds/tiers as desired.
+    function getDynamicInterestRate() public view returns (uint256) {
+        if (totalCollateral == 0) return INTEREST_RATE_BP; // avoid div-by-zero
+
+        uint256 utilizationPct = totalLoans.mul(100).div(totalCollateral);
+        if (utilizationPct < 50) {
+            return 300; // 3%
+        } else if (utilizationPct < 80) {
+            return 500; // 5%
+        } else {
+            return 800; // 8%
+        }
+    }
+
+    // --- View pending interest since last accrual (net of fee) ---
+    function getPendingInterest(address borrower) public view returns (uint256) {
+        Loan memory loan = loans[borrower];
+        if (!loan.isActive || loan.principal == 0) return 0;
+
+        if (block.timestamp <= loan.lastInterestTime) return 0;
+        uint256 timeElapsed = block.timestamp.sub(loan.lastInterestTime);
+        if (timeElapsed == 0) return 0;
+
+        uint256 yearSeconds = 365 days;
+        uint256 dynRateBp = getDynamicInterestRate();
+        // principal * rate(bp) * time / (year) / 100 (because bp already /100)
+        uint256 grossInterest = loan.principal.mul(dynRateBp).mul(timeElapsed).div(yearSeconds).div(100);
+
+        uint256 fee = grossInterest.mul(INTEREST_FEE_BP).div(BP_DIVISOR);
+        return grossInterest.sub(fee);
     }
 
     // --- Internal: accrue interest since lastInterestTime for a borrower ---
@@ -122,18 +163,18 @@ contract EnhancedProjectV3 is ReentrancyGuard {
         uint256 timeElapsed = nowTs.sub(loan.lastInterestTime);
         if (timeElapsed == 0) return;
 
-        // interest = principal * rate * timeElapsed / (yearInSeconds)
         uint256 yearSeconds = 365 days;
-        uint256 interest = loan.principal.mul(INTEREST_RATE_BP).mul(timeElapsed).div(yearSeconds).div(100); // because INTEREST_RATE_BP is in bp/100
+        uint256 dynRateBp = getDynamicInterestRate();
+        uint256 grossInterest = loan.principal.mul(dynRateBp).mul(timeElapsed).div(yearSeconds).div(100);
 
-        if (interest == 0) {
+        if (grossInterest == 0) {
             loan.lastInterestTime = nowTs;
             return;
         }
 
         // Split fee to protocol reserve
-        uint256 fee = interest.mul(INTEREST_FEE_BP).div(BP_DIVISOR); // e.g., 10% when INTEREST_FEE_BP = 1000
-        uint256 interestAfterFee = interest.sub(fee);
+        uint256 fee = grossInterest.mul(INTEREST_FEE_BP).div(BP_DIVISOR);
+        uint256 interestAfterFee = grossInterest.sub(fee);
 
         loan.interestAccrued = loan.interestAccrued.add(interestAfterFee);
 
@@ -146,55 +187,50 @@ contract EnhancedProjectV3 is ReentrancyGuard {
         emit InterestAccrued(borrower, interestAfterFee, fee);
     }
 
-    // --- Repay loan (payable) ---
-    // Repayment reduces interestAccrued first, then principal.
-    function repayLoan() external payable nonReentrant {
-        require(msg.value > 0, "Repay must be > 0");
-        Loan storage loan = loans[msg.sender];
+    // --- Internal: process repayment logic and emit event ---
+    function _processRepayment(address payer, uint256 amount) internal returns (uint256 principalReduced, uint256 interestReduced) {
+        require(amount > 0, "Repay must be > 0");
+        Loan storage loan = loans[payer];
         require(loan.isActive, "No active loan");
 
         // Accrue interest up to now
-        _accrueInterest(msg.sender);
+        _accrueInterest(payer);
 
-        uint256 amountPaid = msg.value;
-        uint256 interestReduced = 0;
-        uint256 principalReduced = 0;
+        uint256 remaining = amount;
 
         // First cover interestAccrued
-        if (amountPaid >= loan.interestAccrued) {
+        if (remaining >= loan.interestAccrued) {
             interestReduced = loan.interestAccrued;
-            amountPaid = amountPaid.sub(loan.interestAccrued);
+            remaining = remaining.sub(loan.interestAccrued);
             loan.interestAccrued = 0;
         } else {
-            interestReduced = amountPaid;
-            loan.interestAccrued = loan.interestAccrued.sub(amountPaid);
-            amountPaid = 0;
+            interestReduced = remaining;
+            loan.interestAccrued = loan.interestAccrued.sub(remaining);
+            remaining = 0;
         }
 
         // Then reduce principal
-        if (amountPaid > 0) {
-            if (amountPaid >= loan.principal) {
+        if (remaining > 0) {
+            if (remaining >= loan.principal) {
                 principalReduced = loan.principal;
-                amountPaid = amountPaid.sub(loan.principal);
+                remaining = remaining.sub(loan.principal);
                 loan.principal = 0;
             } else {
-                principalReduced = amountPaid;
-                loan.principal = loan.principal.sub(amountPaid);
-                amountPaid = 0;
+                principalReduced = remaining;
+                loan.principal = loan.principal.sub(remaining);
+                remaining = 0;
             }
         }
 
         // Update global accounting
         uint256 totalReduced = interestReduced.add(principalReduced);
         if (totalReduced > 0) {
-            // totalLoans tracks outstanding principal+interest (excluding protocolReserve)
             totalLoans = totalLoans.sub(totalReduced);
         }
 
-        // Adjust user record
+        // Adjust user record (principal part only)
         if (principalReduced > 0) {
-            // users[msg.sender].loanTaken represents principal outstanding
-            users[msg.sender].loanTaken = users[msg.sender].loanTaken.sub(principalReduced);
+            users[payer].loanTaken = users[payer].loanTaken.sub(principalReduced);
         }
 
         // If fully repaid
@@ -203,7 +239,23 @@ contract EnhancedProjectV3 is ReentrancyGuard {
             loan.lastInterestTime = 0;
         }
 
-        emit LoanRepaid(msg.sender, msg.value, principalReduced, interestReduced);
+        emit LoanRepaid(payer, amount, principalReduced, interestReduced);
+
+        // Any "remaining" here would be an overpay, but by construction we enforce msg.value == amount from caller.
+        return (principalReduced, interestReduced);
+    }
+
+    // --- Repay loan (payable) ---
+    function repayLoan() external payable nonReentrant {
+        require(msg.value > 0, "Repay must be > 0");
+        _processRepayment(msg.sender, msg.value);
+    }
+
+    // --- Repay a specific amount (explicit) ---
+    function repayPartial(uint256 repayAmount) external payable nonReentrant {
+        require(repayAmount > 0, "Invalid repay amount");
+        require(msg.value == repayAmount, "ETH must match repayAmount");
+        _processRepayment(msg.sender, repayAmount);
     }
 
     // --- Withdraw collateral (only allowed while loan is active and respecting ratio) ---
@@ -213,7 +265,7 @@ contract EnhancedProjectV3 is ReentrancyGuard {
         require(loan.isActive, "No active loan");
 
         // cooldown: 1 hour since last collateral deposit
-        require(block.timestamp > loan.lastDepositTime + 1 hours, "Collateral locked, wait before withdrawing");
+        require(block.timestamp > loan.lastDepositTime + 1 hours, "Collateral locked");
 
         // Accrue interest first
         _accrueInterest(msg.sender);
@@ -224,11 +276,11 @@ contract EnhancedProjectV3 is ReentrancyGuard {
 
         // total owed = principal + interestAccrued
         uint256 totalOwed = loan.principal.add(loan.interestAccrued);
-        require(totalOwed > 0, "No owed amount (should not happen)");
+        require(totalOwed > 0, "No owed amount");
 
         // New health ratio
         uint256 ratio = newCollateral.mul(100).div(totalOwed);
-        require(ratio >= COLLATERAL_RATIO, "Would fall below collateral ratio");
+        require(ratio >= COLLATERAL_RATIO, "Would drop below ratio");
 
         // Update states
         loan.collateral = newCollateral;
@@ -242,25 +294,35 @@ contract EnhancedProjectV3 is ReentrancyGuard {
         require(sent, "Transfer failed");
     }
 
+    // --- Emergency withdraw (when NO active loan) ---
+    function emergencyWithdrawCollateral(uint256 amount) external nonReentrant {
+        require(amount > 0, "Invalid amount");
+        require(!loans[msg.sender].isActive, "Active loan exists");
+        require(users[msg.sender].collateralDeposited >= amount, "Insufficient collateral");
+
+        users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.sub(amount);
+        totalCollateral = totalCollateral.sub(amount);
+
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        require(sent, "Transfer failed");
+    }
+
     // --- Liquidation ---
-    // Any account can liquidate a borrower's loan by repaying full owed amount (principal + interestAccrued).
-    // Liquidator must send the exact amount equal to totalOwed. Liquidator receives LIQUIDATION_BONUS% of borrower's collateral.
-    // Remaining collateral is stored to protocolReserve (left in contract).
+    // Any account can liquidate by repaying full owed (principal + interest).
+    // Liquidator pays msg.value == totalOwed and receives LIQUIDATION_BONUS% of borrower's collateral.
+    // Remaining collateral goes to protocolReserve.
     function liquidate(address borrower) external payable nonReentrant {
         Loan storage loan = loans[borrower];
-        require(loan.isActive, "No active loan to liquidate");
+        require(loan.isActive, "No active loan");
 
         // Accrue interest for borrower
         _accrueInterest(borrower);
 
         uint256 totalOwed = loan.principal.add(loan.interestAccrued);
-        require(totalOwed > 0, "No debt to liquidate");
-
-        // health ratio
+        require(totalOwed > 0, "No debt");
         uint256 ratio = loan.collateral.mul(100).div(totalOwed);
-        require(ratio < LIQUIDATION_THRESHOLD, "Loan is healthy; cannot liquidate");
-
-        require(msg.value == totalOwed, "Must repay full owed amount to liquidate");
+        require(ratio < LIQUIDATION_THRESHOLD, "Loan healthy");
+        require(msg.value == totalOwed, "Must repay full owed");
 
         // Calculate bonus collateral to liquidator
         uint256 bonusCollateral = loan.collateral.mul(LIQUIDATION_BONUS).div(100);
@@ -290,16 +352,16 @@ contract EnhancedProjectV3 is ReentrancyGuard {
             require(paid, "Paying liquidator failed");
         }
 
-        // Keep the remainingCollateral inside contract as protocolReserve
+        // Remaining collateral becomes protocol reserve
         protocolReserve = protocolReserve.add(remainingCollateral);
 
         emit LoanLiquidated(msg.sender, borrower, totalOwed, bonusCollateral);
     }
 
     // --- Helper views ---
-    // Returns large number (max uint) when no loan (signifies 'infinite' / healthy)
-    function getHealthFactor(address user) external view returns (uint256) {
-        Loan memory loan = loans[user];
+    // Returns large number (max uint) when no loan
+    function getHealthFactor(address userAddr) external view returns (uint256) {
+        Loan memory loan = loans[userAddr];
         if (!loan.isActive) return type(uint256).max;
         uint256 totalOwed = loan.principal.add(loan.interestAccrued);
         if (totalOwed == 0) return type(uint256).max;
@@ -307,13 +369,13 @@ contract EnhancedProjectV3 is ReentrancyGuard {
     }
 
     // Return collateral, principal, interest, and health in single call
-    function getUserPortfolio(address user) external view returns (
+    function getUserPortfolio(address userAddr) external view returns (
         uint256 collateral,
         uint256 principal,
         uint256 interestAccrued,
         uint256 healthFactor
     ) {
-        Loan memory loan = loans[user];
+        Loan memory loan = loans[userAddr];
         collateral = loan.collateral;
         principal = loan.principal;
         interestAccrued = loan.interestAccrued;
@@ -324,20 +386,20 @@ contract EnhancedProjectV3 is ReentrancyGuard {
         }
     }
 
-    // --- Admin helper: withdraw collected protocol reserve to owner (not implemented owner logic for brevity) ---
-    // For production, add Ownable and restrict access. Here it's a public function that sends reserve to caller
-    // (for testing/demonstration). Replace with proper access control as needed.
-    function withdrawProtocolReserve(uint256 amount) external nonReentrant {
+    // --- Admin: withdraw collected protocol reserve to owner ---
+    function withdrawProtocolReserve(uint256 amount) external onlyOwner nonReentrant {
         require(amount > 0, "Invalid amount");
-        require(amount <= protocolReserve, "Amount exceeds reserve");
+        require(amount <= protocolReserve, "Exceeds reserve");
         protocolReserve = protocolReserve.sub(amount);
 
         (bool sent, ) = msg.sender.call{value: amount}("");
         require(sent, "Transfer failed");
+
+        emit ProtocolReserveWithdrawn(msg.sender, amount);
     }
 
-    // Fallback / receive to accept ETH (e.g., from direct transfers or leftover transfers)
+    // Fallback / receive to accept ETH (e.g., direct transfers)
     receive() external payable {
-        // allow receiving ETH; this will increase contract balance but not protocolReserve / totalCollateral variables.
+        // Receiving ETH increases contract balance but not counters unless routed via functions.
     }
 }
