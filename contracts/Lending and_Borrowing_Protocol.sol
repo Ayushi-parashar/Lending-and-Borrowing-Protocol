@@ -61,9 +61,132 @@ contract EnhancedProjectV3 is ReentrancyGuard, Ownable, Pausable {
         _;
     }
 
-    // ------------ Existing core functions (deposit, withdraw, borrow, repay etc.) stay same ------------
+    // ------------ New Core Functions ------------
 
-    // 🔹 New Owner-Only Functions
+    function depositCollateral() external payable updateRewards(msg.sender) whenNotPaused {
+        require(msg.value > 0, "Deposit must be > 0");
+        users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.add(msg.value);
+        totalCollateral = totalCollateral.add(msg.value);
+        emit CollateralDeposited(msg.sender, msg.value, users[msg.sender].collateralDeposited);
+    }
+
+    function withdrawCollateral(uint256 amount) external updateRewards(msg.sender) nonReentrant {
+        require(amount > 0, "Invalid amount");
+        require(block.timestamp >= collateralCooldown[msg.sender].add(cooldownPeriod), "Cooldown active");
+        require(users[msg.sender].collateralDeposited >= amount, "Not enough collateral");
+
+        // Ensure after withdrawal, collateral ratio is not violated
+        uint256 borrowed = users[msg.sender].borrowed;
+        if (borrowed > 0) {
+            uint256 minRequired = borrowed.mul(collateralRatio).div(100);
+            require(users[msg.sender].collateralDeposited.sub(amount) >= minRequired, "Collateral ratio too low");
+        }
+
+        users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.sub(amount);
+        totalCollateral = totalCollateral.sub(amount);
+        collateralCooldown[msg.sender] = block.timestamp;
+
+        payable(msg.sender).transfer(amount);
+        emit CollateralWithdrawn(msg.sender, amount, users[msg.sender].collateralDeposited);
+    }
+
+    function borrow(uint256 amount) external updateRewards(msg.sender) nonReentrant {
+        require(amount > 0, "Invalid borrow amount");
+        uint256 maxBorrow = users[msg.sender].collateralDeposited.mul(100).div(collateralRatio);
+        require(users[msg.sender].borrowed.add(amount) <= maxBorrow, "Exceeds borrow limit");
+
+        Loan storage loan = loans[msg.sender];
+        if (!loan.isActive) {
+            loan.isActive = true;
+            borrowers.push(msg.sender);
+        }
+        loan.principal = loan.principal.add(amount);
+        loan.startTime = block.timestamp;
+        loan.collateral = users[msg.sender].collateralDeposited;
+
+        users[msg.sender].borrowed = users[msg.sender].borrowed.add(amount);
+        totalBorrowed = totalBorrowed.add(amount);
+
+        payable(msg.sender).transfer(amount);
+        emit Borrowed(msg.sender, amount, users[msg.sender].borrowed);
+    }
+
+    function repay() external payable updateRewards(msg.sender) nonReentrant {
+        require(msg.value > 0, "Repay amount must be > 0");
+        Loan storage loan = loans[msg.sender];
+        require(loan.isActive, "No active loan");
+
+        uint256 elapsed = block.timestamp.sub(loan.startTime);
+        uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
+        uint256 totalDue = loan.principal.add(interest);
+
+        if (msg.value >= totalDue) {
+            // full repayment
+            uint256 excess = msg.value.sub(totalDue);
+            if (excess > 0) payable(msg.sender).transfer(excess);
+            users[msg.sender].borrowed = 0;
+            loan.isActive = false;
+            loan.principal = 0;
+            loan.interestAccrued = 0;
+        } else {
+            // partial repayment
+            loan.principal = loan.principal.sub(msg.value);
+            users[msg.sender].borrowed = users[msg.sender].borrowed.sub(msg.value);
+        }
+
+        totalBorrowed = totalBorrowed.sub(msg.value);
+        emit Repaid(msg.sender, msg.value, users[msg.sender].borrowed);
+    }
+
+    function liquidate(address borrower) external nonReentrant {
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+
+        uint256 borrowed = users[borrower].borrowed;
+        uint256 requiredCollateral = borrowed.mul(collateralRatio).div(100);
+        require(users[borrower].collateralDeposited < requiredCollateral, "Not liquidatable");
+
+        uint256 seizedCollateral = users[borrower].collateralDeposited;
+        users[borrower].collateralDeposited = 0;
+        users[borrower].borrowed = 0;
+        loan.isActive = false;
+
+        payable(msg.sender).transfer(seizedCollateral);
+        emit Liquidated(msg.sender, borrower, seizedCollateral);
+    }
+
+    function claimRewards() external updateRewards(msg.sender) {
+        uint256 reward = users[msg.sender].rewards;
+        require(reward > 0, "No rewards to claim");
+
+        users[msg.sender].rewards = 0;
+        payable(msg.sender).transfer(reward);
+        emit RewardClaimed(msg.sender, reward);
+    }
+
+    // ------------ View Functions ------------
+
+    function getUserSummary(address user) external view returns (uint256 collateral, uint256 borrowed, uint256 pendingInterest, uint256 pendingRewards) {
+        collateral = users[user].collateralDeposited;
+        borrowed = users[user].borrowed;
+
+        Loan memory loan = loans[user];
+        if (loan.isActive && loan.principal > 0) {
+            uint256 elapsed = block.timestamp.sub(loan.startTime);
+            pendingInterest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
+        }
+
+        if (users[user].collateralDeposited > 0) {
+            uint256 timeDiff = block.timestamp.sub(users[user].lastActionTime);
+            uint256 reward = users[user].collateralDeposited.mul(rewardRate).mul(timeDiff).div(1e18);
+            pendingRewards = users[user].rewards.add(reward);
+        } else {
+            pendingRewards = users[user].rewards;
+        }
+    }
+
+    // ------------ Owner Functions ------------
+
     function setCollateralRatio(uint256 newRatio) external onlyOwner {
         require(newRatio >= 100, "Ratio must be >= 100");
         collateralRatio = newRatio;
@@ -85,24 +208,6 @@ contract EnhancedProjectV3 is ReentrancyGuard, Ownable, Pausable {
         emit CooldownPeriodUpdated(newPeriod);
     }
 
-    // 🔹 View Functions
-    function calculatePendingInterest(address borrower) external view returns (uint256) {
-        Loan memory loan = loans[borrower];
-        if (!loan.isActive || loan.principal == 0) return 0;
-        uint256 elapsed = block.timestamp.sub(loan.startTime);
-        uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
-        return loan.interestAccrued.add(interest);
-    }
-
-    function calculatePendingRewards(address user) external view returns (uint256) {
-        User memory u = users[user];
-        if (u.collateralDeposited == 0) return u.rewards;
-        uint256 timeDiff = block.timestamp.sub(u.lastActionTime);
-        uint256 reward = u.collateralDeposited.mul(rewardRate).mul(timeDiff).div(1e18);
-        return u.rewards.add(reward);
-    }
-
-    // 🔹 Emergency Withdraw (onlyOwner)
     function emergencyWithdraw(uint256 amount) external onlyOwner {
         require(amount <= address(this).balance, "Insufficient balance");
         payable(owner()).transfer(amount);
