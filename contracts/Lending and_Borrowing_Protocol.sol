@@ -6,7 +6,7 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
-contract EnhancedProjectV4 is ReentrancyGuard, Ownable, Pausable {
+contract EnhancedProjectV5 is ReentrancyGuard, Ownable, Pausable {
     using SafeMath for uint256;
 
     struct Loan {
@@ -14,501 +14,260 @@ contract EnhancedProjectV4 is ReentrancyGuard, Ownable, Pausable {
         uint256 interestAccrued;
         uint256 startTime;
         bool isActive;
-        uint256 collateralAtBorrow;
     }
 
     struct User {
-        uint256 collateralDeposited;
+        uint256 deposited;
         uint256 borrowed;
-        uint256 rewards;
-        uint256 lastActionTime;
+        uint256 collateralDeposited;
+        uint256 rewardDebt;
+        bool isBlacklisted;
     }
 
-    // Core storage
-    mapping(address => Loan) public loans;
     mapping(address => User) public users;
-    mapping(address => uint256) public collateralCooldown;
-    mapping(address => uint256) public stakedCollateral;
-    mapping(address => bool) public whitelisted;
-    mapping(address => bool) public blacklisted;
+    mapping(address => Loan) public loans;
+    mapping(address => uint256) public rewards;
 
-    uint256 public totalCollateral;
+    uint256 public totalDeposits;
     uint256 public totalBorrowed;
-    uint256 public collateralRatio = 150; // % requirement
-    uint256 public baseInterestRate = 5;  // yearly %
-    uint256 public rewardRate = 1;        // reward per second per collateral (units scaled by 1e18)
-    uint256 public cooldownPeriod = 1 hours;
-    uint256 public penaltyRate = 2;      // % per overdue week (applies after 365 days)
-    uint256 public flashLoanFeeBP = 50;  // basis points (50 = 0.5%)
+    uint256 public totalCollateral;
+    uint256 public baseInterestRate = 5;
+    uint256 public collateralRatio = 150;
+    uint256 public rewardRate = 100;
 
-    address[] public borrowers;
+    // Fine-grained pause controls
+    bool public borrowingPaused = false;
+    bool public repaymentPaused = false;
+    bool public flashLoanPaused = false;
 
-    // Whitelist enforcement toggle
-    bool public whitelistEnforced = false;
-
-    // Events
-    event CollateralDeposited(address indexed user, uint256 amount, uint256 total);
-    event CollateralWithdrawn(address indexed user, uint256 amount, uint256 remaining);
-    event Borrowed(address indexed user, uint256 amount, uint256 totalBorrowed);
-    event Repaid(address indexed user, uint256 amount, uint256 remaining);
+    event Deposited(address indexed user, uint256 amount);
+    event Borrowed(address indexed user, uint256 amount);
+    event Repaid(address indexed user, uint256 amount);
+    event CollateralDeposited(address indexed user, uint256 amount);
+    event CollateralWithdrawn(address indexed user, uint256 amount);
     event Liquidated(address indexed liquidator, address indexed borrower, uint256 collateralSeized);
-    event RewardClaimed(address indexed user, uint256 reward);
-
-    event CollateralRatioUpdated(uint256 newRatio);
-    event InterestRateUpdated(uint256 newRate);
-    event RewardRateUpdated(uint256 newRate);
-    event CooldownPeriodUpdated(uint256 newPeriod);
-    event PenaltyRateUpdated(uint256 newRate);
-    event FlashLoanFeeUpdated(uint256 newFeeBP);
-    event EmergencyWithdrawal(uint256 amount, address owner);
-
-    event CollateralStaked(address indexed user, uint256 amount);
-    event CollateralUnstaked(address indexed user, uint256 amount);
-
-    event Whitelisted(address indexed user);
+    event FlashLoanExecuted(address indexed borrower, uint256 amount);
+    event RewardClaimed(address indexed user, uint256 amount);
     event Blacklisted(address indexed user);
-    event WhitelistRemoved(address indexed user);
-    event BlacklistRemoved(address indexed user);
-
-    event FlashLoanExecuted(address indexed borrower, uint256 amount, uint256 fee);
-    event LoanTransferred(address from, address to, uint256 principalAmount);
-
-    // New events
-    event WhitelistEnforcedUpdated(bool enforced);
-    event InterestAccrued(address indexed borrower, uint256 interestAdded);
-    event LoanCollateralTransferred(address indexed from, address indexed to, uint256 collateralAmount);
-
-    // ---------- Modifiers ----------
-    modifier updateRewards(address user) {
-        // initialize lastActionTime if first time to avoid huge diffs
-        if (users[user].lastActionTime == 0) {
-            users[user].lastActionTime = block.timestamp;
-        } else {
-            if (users[user].collateralDeposited > 0) {
-                uint256 timeDiff = block.timestamp.sub(users[user].lastActionTime);
-                // rewardRate assumed in "tokens per second per wei-collateral" scaled by 1e18
-                uint256 reward = users[user].collateralDeposited.mul(rewardRate).mul(timeDiff).div(1e18);
-                users[user].rewards = users[user].rewards.add(reward);
-            }
-            users[user].lastActionTime = block.timestamp;
-        }
-        _;
-    }
+    event RemovedFromBlacklist(address indexed user);
+    event BorrowingPaused(bool status);
+    event RepaymentPaused(bool status);
+    event FlashLoanPaused(bool status);
 
     modifier notBlacklisted() {
-        require(!blacklisted[msg.sender], "Blacklisted");
+        require(!users[msg.sender].isBlacklisted, "User is blacklisted");
         _;
     }
 
-    modifier onlyWhitelistedIfSet() {
-        if (whitelistEnforced) {
-            require(whitelisted[msg.sender], "Whitelist enforced: caller not whitelisted");
-        }
+    modifier updateRewards(address user) {
+        rewards[user] = rewards[user].add(pendingRewards(user));
+        users[user].rewardDebt = block.timestamp;
         _;
     }
 
-    // ---------- Core functions ----------
-    receive() external payable {} // allow contract to receive ETH
+    modifier whenBorrowingNotPaused() {
+        require(!borrowingPaused, "Borrowing paused");
+        _;
+    }
 
-    // deposit collateral (whitelist enforced if enabled)
-    function depositCollateral() external payable updateRewards(msg.sender) whenNotPaused notBlacklisted onlyWhitelistedIfSet {
-        require(msg.value > 0, "Deposit must be > 0");
+    modifier whenRepaymentNotPaused() {
+        require(!repaymentPaused, "Repayments paused");
+        _;
+    }
+
+    modifier whenFlashLoanNotPaused() {
+        require(!flashLoanPaused, "Flash loans paused");
+        _;
+    }
+
+    // ---------- Core Functions ----------
+
+    function depositCollateral() external payable notBlacklisted updateRewards(msg.sender) {
+        require(msg.value > 0, "Must deposit collateral");
         users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.add(msg.value);
         totalCollateral = totalCollateral.add(msg.value);
-        emit CollateralDeposited(msg.sender, msg.value, users[msg.sender].collateralDeposited);
+        emit CollateralDeposited(msg.sender, msg.value);
     }
 
-    function withdrawCollateral(uint256 amount) external updateRewards(msg.sender) nonReentrant notBlacklisted onlyWhitelistedIfSet {
+    function withdrawCollateral(uint256 amount) external nonReentrant notBlacklisted updateRewards(msg.sender) {
         require(amount > 0, "Invalid amount");
-        require(block.timestamp >= collateralCooldown[msg.sender].add(cooldownPeriod), "Cooldown active");
         require(users[msg.sender].collateralDeposited >= amount, "Not enough collateral");
 
         uint256 borrowed = users[msg.sender].borrowed;
         if (borrowed > 0) {
-            uint256 minRequired = borrowed.mul(collateralRatio).div(100);
-            require(users[msg.sender].collateralDeposited.sub(amount) >= minRequired, "Collateral ratio too low");
+            uint256 requiredCollateral = borrowed.mul(collateralRatio).div(100);
+            require(users[msg.sender].collateralDeposited.sub(amount) >= requiredCollateral, "Collateral ratio too low");
         }
 
         users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.sub(amount);
         totalCollateral = totalCollateral.sub(amount);
-        collateralCooldown[msg.sender] = block.timestamp;
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        require(sent, "Collateral withdrawal failed");
 
-        (bool success, ) = msg.sender.call{value: amount}("");
-        require(success, "Transfer failed");
-
-        emit CollateralWithdrawn(msg.sender, amount, users[msg.sender].collateralDeposited);
+        emit CollateralWithdrawn(msg.sender, amount);
     }
 
-    function stakeCollateral(uint256 amount) external updateRewards(msg.sender) notBlacklisted onlyWhitelistedIfSet {
-        require(amount > 0, "Invalid amount");
-        require(users[msg.sender].collateralDeposited >= amount, "Not enough collateral to stake");
-        users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.sub(amount);
-        stakedCollateral[msg.sender] = stakedCollateral[msg.sender].add(amount);
-        emit CollateralStaked(msg.sender, amount);
-    }
-
-    function unstakeCollateral(uint256 amount) external updateRewards(msg.sender) notBlacklisted onlyWhitelistedIfSet {
-        require(amount > 0, "Invalid amount");
-        require(stakedCollateral[msg.sender] >= amount, "Not enough staked collateral");
-        stakedCollateral[msg.sender] = stakedCollateral[msg.sender].sub(amount);
-        users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.add(amount);
-        emit CollateralUnstaked(msg.sender, amount);
-    }
-
-    function borrow(uint256 amount) external updateRewards(msg.sender) nonReentrant whenNotPaused notBlacklisted onlyWhitelistedIfSet {
+    function borrow(uint256 amount) external whenBorrowingNotPaused nonReentrant notBlacklisted updateRewards(msg.sender) {
         require(amount > 0, "Invalid borrow amount");
-        uint256 maxBorrow = users[msg.sender].collateralDeposited.mul(100).div(collateralRatio);
-        require(users[msg.sender].borrowed.add(amount) <= maxBorrow, "Exceeds borrow limit");
 
-        Loan storage loan = loans[msg.sender];
-        if (!loan.isActive) {
-            loan.isActive = true;
-            borrowers.push(msg.sender);
-        }
-        loan.principal = loan.principal.add(amount);
-        loan.startTime = block.timestamp;
-        loan.collateralAtBorrow = users[msg.sender].collateralDeposited;
+        uint256 collateral = users[msg.sender].collateralDeposited;
+        uint256 borrowed = users[msg.sender].borrowed.add(amount);
+        uint256 requiredCollateral = borrowed.mul(collateralRatio).div(100);
 
-        users[msg.sender].borrowed = users[msg.sender].borrowed.add(amount);
+        require(collateral >= requiredCollateral, "Not enough collateral");
+
+        users[msg.sender].borrowed = borrowed;
         totalBorrowed = totalBorrowed.add(amount);
 
-        (bool success, ) = msg.sender.call{value: amount}("");
-        require(success, "Transfer failed");
+        loans[msg.sender] = Loan({
+            principal: borrowed,
+            interestAccrued: 0,
+            startTime: block.timestamp,
+            isActive: true
+        });
 
-        emit Borrowed(msg.sender, amount, users[msg.sender].borrowed);
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        require(sent, "Borrow transfer failed");
+
+        emit Borrowed(msg.sender, amount);
     }
 
-    // Original repay() kept: payer repays their own debt
-    function repay() external payable updateRewards(msg.sender) nonReentrant notBlacklisted onlyWhitelistedIfSet {
-        require(msg.value > 0, "Repay amount must be > 0");
-        _repayCore(msg.sender, msg.value);
-        emit Repaid(msg.sender, msg.value, users[msg.sender].borrowed);
-    }
-
-    // New: allow a third party to repay on behalf of borrower
-    function repayFor(address borrower) external payable updateRewards(borrower) nonReentrant notBlacklisted onlyWhitelistedIfSet {
-        require(msg.value > 0, "Repay amount must be > 0");
-        _repayCore(borrower, msg.value);
-        emit Repaid(borrower, msg.value, users[borrower].borrowed);
-    }
-
-    // internal common repay logic - applies payment to interest -> penalty -> principal
-    function _repayCore(address payerLoanOwner, uint256 amount) internal {
-        Loan storage loan = loans[payerLoanOwner];
+    function repay() external payable whenRepaymentNotPaused nonReentrant notBlacklisted updateRewards(msg.sender) {
+        Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No active loan");
+        require(msg.value > 0, "Invalid repay amount");
 
         uint256 elapsed = block.timestamp.sub(loan.startTime);
         uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
-        uint256 penalty = calculatePenalty(payerLoanOwner); // may be zero
-        uint256 totalDue = loan.principal.add(interest).add(penalty);
 
-        if (amount >= totalDue) {
-            // full repayment
-            uint256 excess = amount.sub(totalDue);
-            uint256 principalRepaid = loan.principal;
+        uint256 totalOwed = loan.principal.add(interest);
+        require(msg.value >= totalOwed, "Not enough to repay");
 
-            // reset loan and user borrowed
-            users[payerLoanOwner].borrowed = users[payerLoanOwner].borrowed.sub(principalRepaid);
-            loan.isActive = false;
-            loan.principal = 0;
-            loan.interestAccrued = 0;
+        users[msg.sender].borrowed = 0;
+        totalBorrowed = totalBorrowed.sub(loan.principal);
 
-            // update totals
-            if (totalBorrowed >= principalRepaid) {
-                totalBorrowed = totalBorrowed.sub(principalRepaid);
-            } else {
-                totalBorrowed = 0;
-            }
+        loan.isActive = false;
 
-            if (excess > 0) {
-                // send back excess to msg.sender (payer)
-                (bool sentExcess, ) = msg.sender.call{value: excess}("");
-                require(sentExcess, "Refund failed");
-            }
-        } else {
-            // partial repayment
-            uint256 remaining = amount;
-
-            // pay interest up to interest
-            if (remaining >= interest) {
-                remaining = remaining.sub(interest);
-                interest = 0;
-            } else {
-                interest = interest.sub(remaining);
-                remaining = 0;
-            }
-
-            // pay penalty
-            if (remaining > 0) {
-                if (remaining >= penalty) {
-                    remaining = remaining.sub(penalty);
-                    penalty = 0;
-                } else {
-                    penalty = penalty.sub(remaining);
-                    remaining = 0;
-                }
-            }
-
-            // remaining goes to principal reduction
-            if (remaining > 0) {
-                uint256 principalReduction = remaining;
-                if (principalReduction > loan.principal) {
-                    principalReduction = loan.principal;
-                }
-                loan.principal = loan.principal.sub(principalReduction);
-                users[payerLoanOwner].borrowed = users[payerLoanOwner].borrowed.sub(principalReduction);
-
-                if (totalBorrowed >= principalReduction) {
-                    totalBorrowed = totalBorrowed.sub(principalReduction);
-                } else {
-                    totalBorrowed = 0;
-                }
-            }
+        uint256 excess = msg.value.sub(totalOwed);
+        if (excess > 0) {
+            (bool refund, ) = msg.sender.call{value: excess}("");
+            require(refund, "Refund failed");
         }
+
+        emit Repaid(msg.sender, msg.value);
     }
 
-    function calculatePenalty(address borrower) public view returns (uint256) {
-        Loan memory loan = loans[borrower];
-        if (!loan.isActive) return 0;
-        uint256 elapsed = block.timestamp.sub(loan.startTime);
-        if (elapsed <= 365 days) return 0;
-        uint256 overdue = elapsed.sub(365 days);
-        uint256 overdueWeeks = overdue.div(7 days);
-        if (overdueWeeks == 0) return 0;
-        // penaltyRate is percent per overdue week
-        return loan.principal.mul(penaltyRate).mul(overdueWeeks).div(100);
-    }
+    // ---------- New Features ----------
 
-    function liquidate(address borrower) external nonReentrant notBlacklisted {
+    // Partial liquidation
+    function partialLiquidate(address borrower, uint256 repayAmount) external payable nonReentrant notBlacklisted {
         Loan storage loan = loans[borrower];
         require(loan.isActive, "No active loan");
+        require(repayAmount > 0, "Invalid repay amount");
 
         uint256 borrowed = users[borrower].borrowed;
         uint256 requiredCollateral = borrowed.mul(collateralRatio).div(100);
         require(users[borrower].collateralDeposited < requiredCollateral, "Not liquidatable");
 
-        uint256 seizedCollateral = users[borrower].collateralDeposited;
+        require(msg.value == repayAmount, "Incorrect repay amount");
+        if (repayAmount > loan.principal) repayAmount = loan.principal;
 
-        // reset borrower data
-        users[borrower].collateralDeposited = 0;
-        users[borrower].borrowed = 0;
-        loan.isActive = false;
-        loan.principal = 0;
-        loan.interestAccrued = 0;
+        loan.principal = loan.principal.sub(repayAmount);
+        users[borrower].borrowed = users[borrower].borrowed.sub(repayAmount);
 
-        // adjust totals conservatively
-        if (totalCollateral >= seizedCollateral) totalCollateral = totalCollateral.sub(seizedCollateral);
+        uint256 seizeCollateral = users[borrower].collateralDeposited.mul(repayAmount).div(borrowed);
+        users[borrower].collateralDeposited = users[borrower].collateralDeposited.sub(seizeCollateral);
+        totalCollateral = totalCollateral.sub(seizeCollateral);
 
-        (bool sent, ) = msg.sender.call{value: seizedCollateral}("");
+        (bool sent, ) = msg.sender.call{value: seizeCollateral}("");
         require(sent, "Transfer failed");
 
-        emit Liquidated(msg.sender, borrower, seizedCollateral);
+        emit Liquidated(msg.sender, borrower, seizeCollateral);
+
+        if (loan.principal == 0) {
+            loan.isActive = false;
+        }
     }
 
-    function claimRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted onlyWhitelistedIfSet {
-        uint256 reward = users[msg.sender].rewards;
-        require(reward > 0, "No rewards to claim");
-        users[msg.sender].rewards = 0;
+    // Loan extension
+    function extendLoan() external payable updateRewards(msg.sender) nonReentrant notBlacklisted {
+        Loan storage loan = loans[msg.sender];
+        require(loan.isActive, "No active loan");
+        require(msg.value > 0, "Payment must be > 0");
 
-        (bool success, ) = msg.sender.call{value: reward}("");
-        require(success, "Reward transfer failed");
+        uint256 elapsed = block.timestamp.sub(loan.startTime);
+        uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
+
+        uint256 totalDue = interest;
+        require(msg.value >= totalDue, "Not enough to cover interest");
+
+        loan.startTime = block.timestamp;
+
+        if (msg.value > totalDue) {
+            (bool refund, ) = msg.sender.call{value: msg.value.sub(totalDue)}("");
+            require(refund, "Refund failed");
+        }
+    }
+
+    // ---------- Flash Loan ----------
+
+    function flashLoan(uint256 amount, address target, bytes calldata data) external whenFlashLoanNotPaused nonReentrant notBlacklisted {
+        uint256 balanceBefore = address(this).balance;
+        require(amount > 0 && amount <= balanceBefore, "Invalid amount");
+
+        (bool sent, ) = target.call{value: amount}(data);
+        require(sent, "Flash loan execution failed");
+
+        uint256 balanceAfter = address(this).balance;
+        require(balanceAfter >= balanceBefore, "Flash loan not repaid");
+
+        emit FlashLoanExecuted(msg.sender, amount);
+    }
+
+    // ---------- Rewards ----------
+
+    function pendingRewards(address user) public view returns (uint256) {
+        uint256 timeDiff = block.timestamp.sub(users[user].rewardDebt);
+        return users[user].deposited.mul(rewardRate).mul(timeDiff).div(365 days).div(100);
+    }
+
+    function claimRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted {
+        uint256 reward = rewards[msg.sender];
+        require(reward > 0, "No rewards");
+        rewards[msg.sender] = 0;
+
+        (bool sent, ) = msg.sender.call{value: reward}("");
+        require(sent, "Reward transfer failed");
 
         emit RewardClaimed(msg.sender, reward);
     }
 
-    // ---------- Flash loan ----------
-    // Borrower must return funds + fee within same tx
-    function flashLoan(uint256 amount, bytes calldata data) external nonReentrant notBlacklisted whenNotPaused onlyWhitelistedIfSet {
-        require(amount > 0, "Invalid amount");
-        require(amount <= address(this).balance, "Not enough liquidity");
+    // ---------- Admin Controls ----------
 
-        uint256 fee = amount.mul(flashLoanFeeBP).div(10000); // basis points
-        uint256 balanceBefore = address(this).balance;
-
-        // send funds and call borrower fallback/receive with data
-        (bool sent, ) = msg.sender.call{value: amount}(data);
-        require(sent, "Flash loan transfer failed");
-
-        // After callback, contract must have repaid + fee
-        require(address(this).balance >= balanceBefore.add(fee), "Flash loan not repaid with fee");
-
-        emit FlashLoanExecuted(msg.sender, amount, fee);
+    function setBorrowingPaused(bool status) external onlyOwner {
+        borrowingPaused = status;
+        emit BorrowingPaused(status);
     }
 
-    // ---------- Loan transfer ----------
-    // Transfer loan obligations from msg.sender to `to`. Recipient must accept and not already have active loan.
-    function transferLoan(address to) external nonReentrant notBlacklisted {
-        require(to != address(0), "Invalid recipient");
-        require(loans[msg.sender].isActive, "No active loan to transfer");
-        require(!loans[to].isActive, "Recipient already has an active loan");
-        require(!blacklisted[to], "Recipient blacklisted");
-
-        loans[to] = loans[msg.sender];
-        loans[msg.sender].isActive = false;
-        loans[msg.sender].principal = 0;
-        loans[msg.sender].interestAccrued = 0;
-
-        // Move borrowed accounting
-        uint256 principalAmount = users[msg.sender].borrowed;
-        users[to].borrowed = users[to].borrowed.add(principalAmount);
-        users[msg.sender].borrowed = 0;
-
-        // Collateral stays with original account in this simple model.
-        emit LoanTransferred(msg.sender, to, principalAmount);
+    function setRepaymentPaused(bool status) external onlyOwner {
+        repaymentPaused = status;
+        emit RepaymentPaused(status);
     }
 
-    // New: Transfer loan and move some collateral from sender to recipient in one call
-    function transferLoanWithCollateral(address to, uint256 collateralAmount) external nonReentrant notBlacklisted {
-        require(to != address(0), "Invalid recipient");
-        require(loans[msg.sender].isActive, "No active loan to transfer");
-        require(!loans[to].isActive, "Recipient already has an active loan");
-        require(!blacklisted[to], "Recipient blacklisted");
-        require(users[msg.sender].collateralDeposited >= collateralAmount, "Not enough collateral to transfer");
-
-        // move loan struct
-        loans[to] = loans[msg.sender];
-        loans[msg.sender].isActive = false;
-        loans[msg.sender].principal = 0;
-        loans[msg.sender].interestAccrued = 0;
-
-        // Move borrowed accounting
-        uint256 principalAmount = users[msg.sender].borrowed;
-        users[to].borrowed = users[to].borrowed.add(principalAmount);
-        users[msg.sender].borrowed = 0;
-
-        // move collateral slice
-        if (collateralAmount > 0) {
-            users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.sub(collateralAmount);
-            users[to].collateralDeposited = users[to].collateralDeposited.add(collateralAmount);
-            emit LoanCollateralTransferred(msg.sender, to, collateralAmount);
-        }
-
-        emit LoanTransferred(msg.sender, to, principalAmount);
+    function setFlashLoanPaused(bool status) external onlyOwner {
+        flashLoanPaused = status;
+        emit FlashLoanPaused(status);
     }
 
-    // ---------- Interest accrual helpers ----------
-    // Pushes elapsed interest into loan.interestAccrued and resets startTime
-    function accrueInterest(address borrower) public {
-        Loan storage loan = loans[borrower];
-        require(loan.isActive, "No active loan");
-
-        uint256 elapsed = block.timestamp.sub(loan.startTime);
-        if (elapsed == 0) return;
-
-        uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
-        if (interest > 0) {
-            loan.interestAccrued = loan.interestAccrued.add(interest);
-            loan.startTime = block.timestamp;
-            emit InterestAccrued(borrower, interest);
-        } else {
-            loan.startTime = block.timestamp; // still reset startTime to avoid recounting tiny fractions
-        }
-    }
-
-    // Batch-accrue for a slice of borrowers to avoid gas exhaustion
-    function accrueInterestForAll(uint256 startIndex, uint256 count) external {
-        uint256 end = startIndex.add(count);
-        if (end > borrowers.length) end = borrowers.length;
-        for (uint256 i = startIndex; i < end; ++i) {
-            address borrower = borrowers[i];
-            if (loans[borrower].isActive) {
-                accrueInterest(borrower);
-            }
-        }
-    }
-
-    // ---------- View functions ----------
-    function getUserSummary(address user) external view returns (uint256 collateral, uint256 borrowed, uint256 pendingInterest, uint256 pendingRewards, uint256 pendingPenalty) {
-        collateral = users[user].collateralDeposited;
-        borrowed = users[user].borrowed;
-
-        Loan memory loan = loans[user];
-        if (loan.isActive && loan.principal > 0) {
-            uint256 elapsed = block.timestamp.sub(loan.startTime);
-            pendingInterest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
-            // include any already accrued interest
-            pendingInterest = pendingInterest.add(loan.interestAccrued);
-        }
-
-        if (users[user].collateralDeposited > 0) {
-            uint256 last = users[user].lastActionTime;
-            if (last == 0) last = block.timestamp;
-            uint256 timeDiff = block.timestamp.sub(last);
-            uint256 reward = users[user].collateralDeposited.mul(rewardRate).mul(timeDiff).div(1e18);
-            pendingRewards = users[user].rewards.add(reward);
-        } else {
-            pendingRewards = users[user].rewards;
-        }
-
-        pendingPenalty = calculatePenalty(user);
-    }
-
-    // ---------- Owner functions ----------
-    function setCollateralRatio(uint256 newRatio) external onlyOwner {
-        require(newRatio >= 100, "Ratio must be >= 100");
-        collateralRatio = newRatio;
-        emit CollateralRatioUpdated(newRatio);
-    }
-
-    function setInterestRate(uint256 newRate) external onlyOwner {
-        baseInterestRate = newRate;
-        emit InterestRateUpdated(newRate);
-    }
-
-    function setRewardRate(uint256 newRate) external onlyOwner {
-        rewardRate = newRate;
-        emit RewardRateUpdated(newRate);
-    }
-
-    function setCooldownPeriod(uint256 newPeriod) external onlyOwner {
-        cooldownPeriod = newPeriod;
-        emit CooldownPeriodUpdated(newPeriod);
-    }
-
-    function setPenaltyRate(uint256 newRate) external onlyOwner {
-        penaltyRate = newRate;
-        emit PenaltyRateUpdated(newRate);
-    }
-
-    function setFlashLoanFeeBP(uint256 newFeeBP) external onlyOwner {
-        flashLoanFeeBP = newFeeBP;
-        emit FlashLoanFeeUpdated(newFeeBP);
-    }
-
-    function emergencyWithdraw(uint256 amount) external onlyOwner {
-        require(amount <= address(this).balance, "Insufficient balance");
-        (bool sent, ) = owner().call{value: amount}("");
-        require(sent, "Withdraw failed");
-        emit EmergencyWithdrawal(amount, owner());
-    }
-
-    // whitelist enforcement toggle
-    function setWhitelistEnforced(bool enforced) external onlyOwner {
-        whitelistEnforced = enforced;
-        emit WhitelistEnforcedUpdated(enforced);
-    }
-
-    // ---------- Admin: whitelist / blacklist ----------
-    function addToWhitelist(address user) external onlyOwner {
-        whitelisted[user] = true;
-        emit Whitelisted(user);
-    }
-    function removeFromWhitelist(address user) external onlyOwner {
-        whitelisted[user] = false;
-        emit WhitelistRemoved(user);
-    }
-
-    function addToBlacklist(address user) external onlyOwner {
-        blacklisted[user] = true;
+    function blacklist(address user) external onlyOwner {
+        users[user].isBlacklisted = true;
         emit Blacklisted(user);
     }
+
     function removeFromBlacklist(address user) external onlyOwner {
-        blacklisted[user] = false;
-        emit BlacklistRemoved(user);
+        users[user].isBlacklisted = false;
+        emit RemovedFromBlacklist(user);
     }
 
-    // ---------- Helpers ----------
-    function getBorrowers() external view returns (address[] memory) {
-        return borrowers;
-    }
+    receive() external payable {}
 }
