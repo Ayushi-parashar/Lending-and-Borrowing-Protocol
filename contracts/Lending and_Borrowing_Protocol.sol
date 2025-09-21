@@ -6,7 +6,7 @@ import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
-contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
+contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
     using SafeMath for uint256;
 
     struct Loan {
@@ -17,23 +17,33 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
     }
 
     struct User {
-        uint256 deposited; // savings / deposits
+        uint256 deposited; // available deposits (savings)
         uint256 borrowed;
         uint256 collateralDeposited;
         uint256 rewardDebt; // timestamp of last reward accounting
         bool isBlacklisted;
+        address referrer; // referral referrer
+    }
+
+    struct FixedDeposit {
+        uint256 amount;
+        uint256 unlockTime;
+        uint256 rateMultiplier; // expressed as percent, e.g., 150 = 1.5x rewardRate
+        bool active;
     }
 
     mapping(address => User) public users;
     mapping(address => Loan) public loans;
     mapping(address => uint256) public rewards;
+    mapping(address => FixedDeposit) public fixedDeposits;
 
     uint256 public totalDeposits;
     uint256 public totalBorrowed;
     uint256 public totalCollateral;
-    uint256 public baseInterestRate = 5; // percent per year
+    uint256 public baseInterestRate = 5; // percent per year (base)
     uint256 public collateralRatio = 150; // percent (e.g., 150 = 150%)
     uint256 public rewardRate = 100; // percent per year of deposited balance (example)
+    uint256 public referralRate = 1; // percent of deposit to give to referrer (1%)
 
     // Fine-grained pause controls
     bool public borrowingPaused = false;
@@ -50,6 +60,7 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
     event Liquidated(address indexed liquidator, address indexed borrower, uint256 collateralSeized);
     event FlashLoanExecuted(address indexed borrower, uint256 amount);
     event RewardClaimed(address indexed user, uint256 amount);
+    event RewardStaked(address indexed user, uint256 amount);
     event Blacklisted(address indexed user);
     event RemovedFromBlacklist(address indexed user);
     event BorrowingPaused(bool status);
@@ -59,17 +70,21 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
     event InterestRateUpdated(uint256 newRate);
     event CollateralRatioUpdated(uint256 newRatio);
     event RewardRateUpdated(uint256 newRate);
+    event ReferralRateUpdated(uint256 newRate);
+    event FixedDepositCreated(address indexed user, uint256 amount, uint256 unlockTime, uint256 multiplier);
+    event FixedDepositWithdrawn(address indexed user, uint256 amount);
+    event LoanForgiven(address indexed borrower, uint256 forgivenAmount);
 
     modifier notBlacklisted() {
         require(!users[msg.sender].isBlacklisted, "User is blacklisted");
-        _;
+        _; 
     }
 
     // Ensure reward calculation does not explode for new users: if rewardDebt == 0 => no pending rewards
-    modifier updateRewards(address user) {
-        rewards[user] = rewards[user].add(pendingRewards(user));
-        users[user].rewardDebt = block.timestamp;
-        _;
+    modifier updateRewards(address userAddr) {
+        rewards[userAddr] = rewards[userAddr].add(pendingRewards(userAddr));
+        users[userAddr].rewardDebt = block.timestamp;
+        _; 
     }
 
     modifier whenBorrowingNotPaused() {
@@ -89,14 +104,32 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
 
     // ---------- Core Functions ----------
 
-    // Deposit for savings / earning rewards
-    function deposit() external payable notBlacklisted updateRewards(msg.sender) {
+    // ETH deposit (savings) - optional referrer argument
+    function depositWithReferrer(address referrer) external payable notBlacklisted updateRewards(msg.sender) {
         require(msg.value > 0, "Deposit must be > 0");
+
+        // set referrer if not already set and referrer isn't the user themself
+        if (users[msg.sender].referrer == address(0) && referrer != address(0) && referrer != msg.sender) {
+            users[msg.sender].referrer = referrer;
+        }
+
+        // Deposit
         users[msg.sender].deposited = users[msg.sender].deposited.add(msg.value);
         totalDeposits = totalDeposits.add(msg.value);
 
-        // Initialize rewardDebt if it was zero (updateRewards already sets it)
+        // referral reward
+        if (users[msg.sender].referrer != address(0) && referralRate > 0) {
+            uint256 referralReward = msg.value.mul(referralRate).div(100);
+            // credit referrer rewards (not direct transfer to avoid reentrancy)
+            rewards[users[msg.sender].referrer] = rewards[users[msg.sender].referrer].add(referralReward);
+        }
+
         emit Deposited(msg.sender, msg.value);
+    }
+
+    // backward-compatible deposit (no referrer)
+    function deposit() external payable {
+        depositWithReferrer(address(0));
     }
 
     function withdraw(uint256 amount) external nonReentrant notBlacklisted updateRewards(msg.sender) {
@@ -118,7 +151,6 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.add(msg.value);
         totalCollateral = totalCollateral.add(msg.value);
 
-        // If rewardDebt was zero, updateRewards modifier set it to now.
         emit CollateralDeposited(msg.sender, msg.value);
     }
 
@@ -174,7 +206,8 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         require(msg.value > 0, "Invalid repay amount");
 
         uint256 elapsed = block.timestamp.sub(loan.startTime);
-        uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
+        uint256 rate = getCurrentInterestRate(); // dynamic
+        uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
 
         uint256 lateFee = calculateLateFee(msg.sender);
 
@@ -241,7 +274,8 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         require(msg.value > 0, "Payment must be > 0");
 
         uint256 elapsed = block.timestamp.sub(loan.startTime);
-        uint256 interest = loan.principal.mul(baseInterestRate).mul(elapsed).div(365 days).div(100);
+        uint256 rate = getCurrentInterestRate(); // dynamic
+        uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
 
         uint256 totalDue = interest;
         require(msg.value >= totalDue, "Not enough to cover interest");
@@ -272,10 +306,26 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
     // ---------- Rewards ----------
 
     // If user.rewardDebt == 0 => user is new/uninitialized => return 0
-    function pendingRewards(address user) public view returns (uint256) {
-        if (users[user].rewardDebt == 0) return 0;
-        uint256 timeDiff = block.timestamp.sub(users[user].rewardDebt);
-        return users[user].deposited.mul(rewardRate).mul(timeDiff).div(365 days).div(100);
+    function pendingRewards(address userAddr) public view returns (uint256) {
+        if (users[userAddr].rewardDebt == 0) return 0;
+
+        uint256 timeDiff = block.timestamp.sub(users[userAddr].rewardDebt);
+
+        // base reward from deposited funds
+        uint256 basePending = users[userAddr].deposited.mul(rewardRate).mul(timeDiff).div(365 days).div(100);
+
+        // if user has an active fixed deposit, apply multiplier for that portion
+        FixedDeposit memory fd = fixedDeposits[userAddr];
+        uint256 fdPending = 0;
+        if (fd.active && fd.amount > 0) {
+            // reward multiplier: rateMultiplier is percent (e.g., 150 => 1.5x)
+            fdPending = fd.amount.mul(rewardRate).mul(fd.rateMultiplier).mul(timeDiff).div(365 days).div(100).div(100);
+            // Note: dividing by 100 twice because rateMultiplier is a percent (e.g., 150)
+        }
+
+        // avoid double-counting: basePending currently uses users[user].deposited only.
+        // fixed deposit's reward is calculated separately (fd.amount is not included in users.deposited)
+        return basePending.add(fdPending);
     }
 
     function claimRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted {
@@ -287,6 +337,60 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         require(sent, "Reward transfer failed");
 
         emit RewardClaimed(msg.sender, reward);
+    }
+
+    // Stake rewards into deposits (compound)
+    function stakeRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted {
+        uint256 reward = rewards[msg.sender];
+        require(reward > 0, "No rewards to stake");
+        rewards[msg.sender] = 0;
+
+        users[msg.sender].deposited = users[msg.sender].deposited.add(reward);
+        totalDeposits = totalDeposits.add(reward);
+
+        emit RewardStaked(msg.sender, reward);
+    }
+
+    // ---------- Fixed Deposit (Time-locked) ----------
+
+    // Create a single fixed deposit per user (simple implementation)
+    // rateMultiplier example: 150 => 1.5x reward rate, must be >= 100
+    function createFixedDeposit(uint256 lockDurationSeconds, uint256 rateMultiplier) external payable notBlacklisted updateRewards(msg.sender) {
+        require(msg.value > 0, "Must deposit amount");
+        require(lockDurationSeconds >= 30 days, "Minimum 30 days");
+        require(rateMultiplier >= 100, "Multiplier must be >= 100");
+
+        FixedDeposit storage fd = fixedDeposits[msg.sender];
+        require(!fd.active, "Existing fixed deposit active");
+
+        fd.amount = msg.value;
+        fd.unlockTime = block.timestamp.add(lockDurationSeconds);
+        fd.rateMultiplier = rateMultiplier;
+        fd.active = true;
+
+        totalDeposits = totalDeposits.add(msg.value);
+
+        emit FixedDepositCreated(msg.sender, msg.value, fd.unlockTime, rateMultiplier);
+    }
+
+    // Withdraw fixed deposit after unlock
+    function withdrawFixedDeposit() external nonReentrant notBlacklisted updateRewards(msg.sender) {
+        FixedDeposit storage fd = fixedDeposits[msg.sender];
+        require(fd.active, "No active fixed deposit");
+        require(block.timestamp >= fd.unlockTime, "Fixed deposit still locked");
+
+        uint256 amount = fd.amount;
+        fd.amount = 0;
+        fd.active = false;
+        fd.unlockTime = 0;
+        fd.rateMultiplier = 0;
+
+        totalDeposits = totalDeposits.sub(amount);
+
+        (bool sent, ) = msg.sender.call{value: amount}("");
+        require(sent, "Fixed deposit withdrawal failed");
+
+        emit FixedDepositWithdrawn(msg.sender, amount);
     }
 
     // ---------- Admin Controls ----------
@@ -317,7 +421,7 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Admin adjustable parameters
-    function setInterestRate(uint256 newRate) external onlyOwner {
+    function setBaseInterestRate(uint256 newRate) external onlyOwner {
         require(newRate > 0 && newRate < 1000, "Invalid interest rate");
         baseInterestRate = newRate;
         emit InterestRateUpdated(newRate);
@@ -335,12 +439,39 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         emit RewardRateUpdated(newRate);
     }
 
+    function setReferralRate(uint256 newRate) external onlyOwner {
+        require(newRate <= 10, "Referral too high"); // example cap
+        referralRate = newRate;
+        emit ReferralRateUpdated(newRate);
+    }
+
     // Emergency withdraw by owner (use with caution)
     function emergencyWithdraw(uint256 amount) external onlyOwner {
         require(amount <= address(this).balance, "Not enough balance");
         (bool sent, ) = owner().call{value: amount}("");
         require(sent, "Emergency withdraw failed");
         emit EmergencyWithdraw(owner(), amount);
+    }
+
+    // Admin: forgive (part of) a loan (emergency/support)
+    function forgiveLoan(address borrower, uint256 amount) external onlyOwner {
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+        require(amount > 0, "Invalid amount");
+
+        if (amount >= loan.principal) {
+            uint256 forgiven = loan.principal;
+            totalBorrowed = totalBorrowed.sub(loan.principal);
+            loan.principal = 0;
+            loan.isActive = false;
+            users[borrower].borrowed = 0;
+            emit LoanForgiven(borrower, forgiven);
+        } else {
+            loan.principal = loan.principal.sub(amount);
+            totalBorrowed = totalBorrowed.sub(amount);
+            users[borrower].borrowed = users[borrower].borrowed.sub(amount);
+            emit LoanForgiven(borrower, amount);
+        }
     }
 
     // ---------- Utility / View Functions ----------
@@ -350,15 +481,24 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         uint256 borrowed,
         uint256 collateral,
         uint256 pendingReward,
-        bool blacklisted
+        bool blacklisted,
+        address referrer,
+        bool hasFixedDeposit,
+        uint256 fixedDepositAmount,
+        uint256 fixedDepositUnlockTime
     ) {
         User memory u = users[user];
+        FixedDeposit memory fd = fixedDeposits[user];
         return (
             u.deposited,
             u.borrowed,
             u.collateralDeposited,
             pendingRewards(user),
-            u.isBlacklisted
+            u.isBlacklisted,
+            u.referrer,
+            fd.active,
+            fd.amount,
+            fd.unlockTime
         );
     }
 
@@ -368,6 +508,18 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         uint256 totalSystemCollateral
     ) {
         return (totalDeposits, totalBorrowed, totalCollateral);
+    }
+
+    // Health Factor example:
+    // Returns 0 if no borrowed amount, otherwise health factor scaled as percent
+    // healthFactor = (collateralDeposited * 100) / requiredCollateral
+    // If < 100 => below required collateral
+    function getHealthFactor(address userAddr) external view returns (uint256) {
+        uint256 borrowed = users[userAddr].borrowed;
+        if (borrowed == 0) return type(uint256).max;
+        uint256 requiredCollateral = borrowed.mul(collateralRatio).div(100);
+        if (requiredCollateral == 0) return type(uint256).max;
+        return users[userAddr].collateralDeposited.mul(100).div(requiredCollateral);
     }
 
     // Late fee: if loan active and elapsed > 365 days apply 2% per 30 days overdue (example)
@@ -385,8 +537,27 @@ contract EnhancedProjectV6 is ReentrancyGuard, Ownable, Pausable {
         return fee;
     }
 
-    // ---------- Receive / Fallback ----------
+    // Dynamic interest rate based on utilization (totalBorrowed / totalDeposits)
+    // Example model:
+    // utilization < 50% -> baseInterestRate
+    // 50% <= utilization < 80% -> base + 2
+    // 80% <= utilization < 95% -> base + 5
+    // >=95% -> base + 10
+    function getCurrentInterestRate() public view returns (uint256) {
+        if (totalDeposits == 0) return baseInterestRate;
+        uint256 utilization = totalBorrowed.mul(100).div(totalDeposits); // percent
+        if (utilization < 50) {
+            return baseInterestRate;
+        } else if (utilization < 80) {
+            return baseInterestRate.add(2);
+        } else if (utilization < 95) {
+            return baseInterestRate.add(5);
+        } else {
+            return baseInterestRate.add(10);
+        }
+    }
 
+    // ---------- Receive / Fallback ----------
     receive() external payable {}
     fallback() external payable {}
 }
