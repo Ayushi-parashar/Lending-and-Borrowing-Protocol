@@ -49,6 +49,10 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
     bool public borrowingPaused = false;
     bool public repaymentPaused = false;
     bool public flashLoanPaused = false;
+    bool public depositPaused = false;
+
+    // Fixed deposit minimum lock duration (configurable)
+    uint256 public minLockDuration = 30 days;
 
     // Events
     event Deposited(address indexed user, uint256 amount);
@@ -66,6 +70,7 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
     event BorrowingPaused(bool status);
     event RepaymentPaused(bool status);
     event FlashLoanPaused(bool status);
+    event DepositPaused(bool status);
     event EmergencyWithdraw(address indexed owner, uint256 amount);
     event InterestRateUpdated(uint256 newRate);
     event CollateralRatioUpdated(uint256 newRatio);
@@ -74,6 +79,11 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
     event FixedDepositCreated(address indexed user, uint256 amount, uint256 unlockTime, uint256 multiplier);
     event FixedDepositWithdrawn(address indexed user, uint256 amount);
     event LoanForgiven(address indexed borrower, uint256 forgivenAmount);
+
+    // New events
+    event PartialRepayment(address indexed payer, address indexed borrower, uint256 paidAmount, uint256 principalReduced);
+    event InterestAccrued(address indexed borrower, uint256 interestAmount);
+    event MinLockDurationUpdated(uint256 newMinLockDuration);
 
     modifier notBlacklisted() {
         require(!users[msg.sender].isBlacklisted, "User is blacklisted");
@@ -89,23 +99,28 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
 
     modifier whenBorrowingNotPaused() {
         require(!borrowingPaused, "Borrowing paused");
-        _;
+        _; 
     }
 
     modifier whenRepaymentNotPaused() {
         require(!repaymentPaused, "Repayments paused");
-        _;
+        _; 
     }
 
     modifier whenFlashLoanNotPaused() {
         require(!flashLoanPaused, "Flash loans paused");
+        _; 
+    }
+
+    modifier whenDepositNotPaused() {
+        require(!depositPaused, "Deposits paused");
         _;
     }
 
     // ---------- Core Functions ----------
 
     // ETH deposit (savings) - optional referrer argument
-    function depositWithReferrer(address referrer) external payable notBlacklisted updateRewards(msg.sender) {
+    function depositWithReferrer(address referrer) external payable notBlacklisted updateRewards(msg.sender) whenDepositNotPaused {
         require(msg.value > 0, "Deposit must be > 0");
 
         // set referrer if not already set and referrer isn't the user themself
@@ -219,6 +234,8 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
         totalBorrowed = totalBorrowed.sub(loan.principal);
 
         loan.isActive = false;
+        loan.principal = 0;
+        loan.interestAccrued = 0;
 
         uint256 excess = msg.value.sub(totalOwed);
         if (excess > 0) {
@@ -279,6 +296,9 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
 
         uint256 totalDue = interest;
         require(msg.value >= totalDue, "Not enough to cover interest");
+
+        // credit any extra to interestAccrued (or refund below)
+        loan.interestAccrued = loan.interestAccrued.add(interest);
 
         loan.startTime = block.timestamp;
 
@@ -357,7 +377,7 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
     // rateMultiplier example: 150 => 1.5x reward rate, must be >= 100
     function createFixedDeposit(uint256 lockDurationSeconds, uint256 rateMultiplier) external payable notBlacklisted updateRewards(msg.sender) {
         require(msg.value > 0, "Must deposit amount");
-        require(lockDurationSeconds >= 30 days, "Minimum 30 days");
+        require(lockDurationSeconds >= minLockDuration, "Minimum lock duration not met");
         require(rateMultiplier >= 100, "Multiplier must be >= 100");
 
         FixedDeposit storage fd = fixedDeposits[msg.sender];
@@ -410,6 +430,11 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
         emit FlashLoanPaused(status);
     }
 
+    function setDepositPaused(bool status) external onlyOwner {
+        depositPaused = status;
+        emit DepositPaused(status);
+    }
+
     function blacklist(address user) external onlyOwner {
         users[user].isBlacklisted = true;
         emit Blacklisted(user);
@@ -443,6 +468,12 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
         require(newRate <= 10, "Referral too high"); // example cap
         referralRate = newRate;
         emit ReferralRateUpdated(newRate);
+    }
+
+    function setMinLockDuration(uint256 newMin) external onlyOwner {
+        require(newMin >= 1 days, "Too small");
+        minLockDuration = newMin;
+        emit MinLockDurationUpdated(newMin);
     }
 
     // Emergency withdraw by owner (use with caution)
@@ -555,6 +586,102 @@ contract EnhancedProjectV7 is ReentrancyGuard, Ownable, Pausable {
         } else {
             return baseInterestRate.add(10);
         }
+    }
+
+    // ---------- New utility functions ----------
+
+    // Partial repay: allows paying interest + late fees first, then principal reduction.
+    // msg.value is applied: interest + lateFee first, remaining reduces principal.
+    function partialRepay(address borrower) external payable whenRepaymentNotPaused nonReentrant notBlacklisted {
+        require(msg.value > 0, "Must send funds");
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+        uint256 elapsed = block.timestamp.sub(loan.startTime);
+        uint256 rate = getCurrentInterestRate();
+        uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
+        uint256 lateFee = calculateLateFee(borrower);
+
+        uint256 totalInterestAndFees = interest.add(lateFee);
+
+        uint256 remaining = msg.value;
+
+        // First cover outstanding interest + late fees
+        if (remaining >= totalInterestAndFees) {
+            // cover interest & late fees
+            remaining = remaining.sub(totalInterestAndFees);
+            // record interest into interestAccrued (or could be treated as paid)
+            if (loan.interestAccrued >= interest) {
+                loan.interestAccrued = loan.interestAccrued.sub(interest);
+            } else {
+                // if not enough accrual recorded, set to 0
+                loan.interestAccrued = 0;
+            }
+        } else {
+            // partially cover interest/fees => reduce interestAccrued proportionally
+            // We simply reduce loan.interestAccrued if present, or ignore because interest was not previously accrued
+            if (remaining > 0) {
+                if (loan.interestAccrued >= remaining) {
+                    loan.interestAccrued = loan.interestAccrued.sub(remaining);
+                } else {
+                    loan.interestAccrued = 0;
+                }
+                remaining = 0;
+            }
+        }
+
+        uint256 principalReduced = 0;
+        if (remaining > 0) {
+            // apply remaining to principal
+            if (remaining >= loan.principal) {
+                principalReduced = loan.principal;
+                remaining = remaining.sub(loan.principal);
+                totalBorrowed = totalBorrowed.sub(loan.principal);
+                users[borrower].borrowed = users[borrower].borrowed.sub(loan.principal);
+                loan.principal = 0;
+                loan.isActive = false;
+            } else {
+                principalReduced = remaining;
+                loan.principal = loan.principal.sub(remaining);
+                totalBorrowed = totalBorrowed.sub(remaining);
+                users[borrower].borrowed = users[borrower].borrowed.sub(remaining);
+                remaining = 0;
+            }
+        }
+
+        // Refund any leftover to payer
+        if (remaining > 0) {
+            (bool refund, ) = msg.sender.call{value: remaining}("");
+            require(refund, "Refund failed");
+        }
+
+        emit PartialRepayment(msg.sender, borrower, msg.value, principalReduced);
+    }
+
+    // Owner can force-interest-accrual to loan.interestAccrued for bookkeeping.
+    function accrueInterestFor(address borrower) external onlyOwner {
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+        uint256 elapsed = block.timestamp.sub(loan.startTime);
+        require(elapsed > 0, "No time elapsed");
+
+        uint256 rate = getCurrentInterestRate();
+        uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
+
+        loan.interestAccrued = loan.interestAccrued.add(interest);
+        loan.startTime = block.timestamp; // reset startTime after accrual
+
+        emit InterestAccrued(borrower, interest);
+    }
+
+    // Return loan summary
+    function getLoanInfo(address borrower) external view returns (
+        uint256 principal,
+        uint256 interestAccrued,
+        uint256 startTime,
+        bool isActive
+    ) {
+        Loan memory loan = loans[borrower];
+        return (loan.principal, loan.interestAccrued, loan.startTime, loan.isActive);
     }
 
     // ---------- Receive / Fallback ----------
