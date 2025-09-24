@@ -5,15 +5,18 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-// EnhancedProjectV8
-// - Adds protocol fee on borrow (accumulates to ownerFees) and owner withdrawal
-// - Allows owner to pause/unpause all core actions with emergencyPauseAll / unpauseAll
-// - Supports multiple fixed deposits per user (array) with indexed withdrawal
-// - Adds repayOnBehalf to let third parties fully repay a borrower's loan
-// - Adds view helpers for fixed deposit counts and protocol fee balance
+// EnhancedProjectV8_plus
+// Additions compared to V8:
+//  - Integrates Pausable's _pause/_unpause and applies whenNotPaused modifier to core user flows
+//  - Batch blacklist/unblacklist by owner
+//  - Rescue ERC20 tokens accidentally sent to contract
+//  - View helpers: getRewardBalance, getProtocolFees
+//  - TokenRescued event
+//  - Minor safety improvements (use of whenNotPaused where appropriate)
 
-contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
+contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
     using SafeMath for uint256;
 
     struct Loan {
@@ -100,6 +103,9 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     event EmergencyPausedAll();
     event EmergencyUnpausedAll();
 
+    // Added events
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
+
     modifier notBlacklisted() {
         require(!users[msg.sender].isBlacklisted, "User is blacklisted");
         _; 
@@ -132,10 +138,10 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         _;
     }
 
-    // ---------- Core Functions ----------
+    // ---------- Core Functions (now protected by whenNotPaused) ----------
 
     // ETH deposit (savings) - optional referrer argument
-    function depositWithReferrer(address referrer) external payable notBlacklisted updateRewards(msg.sender) whenDepositNotPaused {
+    function depositWithReferrer(address referrer) external payable notBlacklisted updateRewards(msg.sender) whenDepositNotPaused whenNotPaused {
         require(msg.value > 0, "Deposit must be > 0");
 
         // set referrer if not already set and referrer isn't the user themself
@@ -162,7 +168,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         depositWithReferrer(address(0));
     }
 
-    function withdraw(uint256 amount) external nonReentrant notBlacklisted updateRewards(msg.sender) {
+    function withdraw(uint256 amount) external nonReentrant notBlacklisted updateRewards(msg.sender) whenNotPaused {
         require(amount > 0, "Invalid withdraw amount");
         require(users[msg.sender].deposited >= amount, "Not enough balance");
 
@@ -176,7 +182,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Collateral-only deposit (used for borrowing)
-    function depositCollateral() external payable notBlacklisted updateRewards(msg.sender) {
+    function depositCollateral() external payable notBlacklisted updateRewards(msg.sender) whenNotPaused {
         require(msg.value > 0, "Must deposit collateral");
         users[msg.sender].collateralDeposited = users[msg.sender].collateralDeposited.add(msg.value);
         totalCollateral = totalCollateral.add(msg.value);
@@ -184,7 +190,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         emit CollateralDeposited(msg.sender, msg.value);
     }
 
-    function withdrawCollateral(uint256 amount) external nonReentrant notBlacklisted updateRewards(msg.sender) {
+    function withdrawCollateral(uint256 amount) external nonReentrant notBlacklisted updateRewards(msg.sender) whenNotPaused {
         require(amount > 0, "Invalid amount");
         require(users[msg.sender].collateralDeposited >= amount, "Not enough collateral");
 
@@ -204,7 +210,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Borrow: now charges a protocol fee that accumulates for owner
-    function borrow(uint256 amount) external whenBorrowingNotPaused nonReentrant notBlacklisted updateRewards(msg.sender) {
+    function borrow(uint256 amount) external whenBorrowingNotPaused nonReentrant notBlacklisted updateRewards(msg.sender) whenNotPaused {
         require(amount > 0, "Invalid borrow amount");
 
         uint256 collateral = users[msg.sender].collateralDeposited;
@@ -239,7 +245,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Calculate interest and late fees included
-    function repay() external payable whenRepaymentNotPaused nonReentrant notBlacklisted updateRewards(msg.sender) {
+    function repay() external payable whenRepaymentNotPaused nonReentrant notBlacklisted updateRewards(msg.sender) whenNotPaused {
         Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No active loan");
         require(msg.value > 0, "Invalid repay amount");
@@ -271,7 +277,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Repay on behalf: allow a third party to fully repay a borrower's loan
-    function repayOnBehalf(address borrower) external payable whenRepaymentNotPaused nonReentrant notBlacklisted updateRewards(borrower) {
+    function repayOnBehalf(address borrower) external payable whenRepaymentNotPaused nonReentrant notBlacklisted updateRewards(borrower) whenNotPaused {
         Loan storage loan = loans[borrower];
         require(loan.isActive, "No active loan");
         require(msg.value > 0, "Invalid repay amount");
@@ -301,10 +307,10 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         emit Repaid(borrower, msg.value);
     }
 
-    // ---------- New Features ----------
+    // ---------- New Features (protected by whenNotPaused where applicable) ----------
 
     // Partial liquidation
-    function partialLiquidate(address borrower, uint256 repayAmount) external payable nonReentrant notBlacklisted {
+    function partialLiquidate(address borrower, uint256 repayAmount) external payable nonReentrant notBlacklisted whenNotPaused {
         Loan storage loan = loans[borrower];
         require(loan.isActive, "No active loan");
         require(repayAmount > 0, "Invalid repay amount");
@@ -340,7 +346,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Loan extension - pay interest to roll the loan forward
-    function extendLoan() external payable updateRewards(msg.sender) nonReentrant notBlacklisted {
+    function extendLoan() external payable updateRewards(msg.sender) nonReentrant notBlacklisted whenNotPaused {
         Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No active loan");
         require(msg.value > 0, "Payment must be > 0");
@@ -365,7 +371,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
 
     // ---------- Flash Loan ----------
 
-    function flashLoan(uint256 amount, address target, bytes calldata data) external whenFlashLoanNotPaused nonReentrant notBlacklisted {
+    function flashLoan(uint256 amount, address target, bytes calldata data) external whenFlashLoanNotPaused nonReentrant notBlacklisted whenNotPaused {
         uint256 balanceBefore = address(this).balance;
         require(amount > 0 && amount <= balanceBefore, "Invalid amount");
 
@@ -405,7 +411,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         return basePending.add(fdPending);
     }
 
-    function claimRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted {
+    function claimRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted whenNotPaused {
         uint256 reward = rewards[msg.sender];
         require(reward > 0, "No rewards");
         rewards[msg.sender] = 0;
@@ -417,7 +423,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Stake rewards into deposits (compound)
-    function stakeRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted {
+    function stakeRewards() external updateRewards(msg.sender) nonReentrant notBlacklisted whenNotPaused {
         uint256 reward = rewards[msg.sender];
         require(reward > 0, "No rewards to stake");
         rewards[msg.sender] = 0;
@@ -432,7 +438,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
 
     // Create a fixed deposit (user can create multiple)
     // rateMultiplier example: 150 => 1.5x reward rate, must be >= 100
-    function createFixedDeposit(uint256 lockDurationSeconds, uint256 rateMultiplier) external payable notBlacklisted updateRewards(msg.sender) {
+    function createFixedDeposit(uint256 lockDurationSeconds, uint256 rateMultiplier) external payable notBlacklisted updateRewards(msg.sender) whenNotPaused {
         require(msg.value > 0, "Must deposit amount");
         require(lockDurationSeconds >= minLockDuration, "Minimum lock duration not met");
         require(rateMultiplier >= 100, "Multiplier must be >= 100");
@@ -452,7 +458,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     }
 
     // Withdraw fixed deposit by index after unlock
-    function withdrawFixedDepositByIndex(uint256 index) external nonReentrant notBlacklisted updateRewards(msg.sender) {
+    function withdrawFixedDepositByIndex(uint256 index) external nonReentrant notBlacklisted updateRewards(msg.sender) whenNotPaused {
         FixedDeposit[] storage fds = fixedDeposits[msg.sender];
         require(index < fds.length, "Invalid FD index");
         FixedDeposit storage fd = fds[index];
@@ -506,12 +512,13 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         emit DepositPaused(status);
     }
 
-    // Emergency pause/unpause all core functions
+    // Emergency pause/unpause all core functions (keeps compatibility with Pausable)
     function emergencyPauseAll() external onlyOwner {
         borrowingPaused = true;
         repaymentPaused = true;
         flashLoanPaused = true;
         depositPaused = true;
+        _pause();
         emit EmergencyPausedAll();
     }
 
@@ -520,7 +527,16 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
         repaymentPaused = false;
         flashLoanPaused = false;
         depositPaused = false;
+        _unpause();
         emit EmergencyUnpausedAll();
+    }
+
+    function pauseContract() external onlyOwner {
+        _pause();
+    }
+
+    function unpauseContract() external onlyOwner {
+        _unpause();
     }
 
     function blacklist(address user) external onlyOwner {
@@ -531,6 +547,14 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     function removeFromBlacklist(address user) external onlyOwner {
         users[user].isBlacklisted = false;
         emit RemovedFromBlacklist(user);
+    }
+
+    // Batch blacklist / remove
+    function batchSetBlacklist(address[] calldata userList, bool status) external onlyOwner {
+        for (uint256 i = 0; i < userList.length; i++) {
+            users[userList[i]].isBlacklisted = status;
+            if (status) emit Blacklisted(userList[i]); else emit RemovedFromBlacklist(userList[i]);
+        }
     }
 
     // Admin adjustable parameters
@@ -606,6 +630,13 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
             users[borrower].borrowed = users[borrower].borrowed.sub(amount);
             emit LoanForgiven(borrower, amount);
         }
+    }
+
+    // Rescue accidentally-sent ERC20 tokens
+    function rescueERC20(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        require(to != address(0), "Invalid recipient");
+        IERC20(token).transfer(to, amount);
+        emit TokenRescued(token, to, amount);
     }
 
     // ---------- Utility / View Functions ----------
@@ -704,7 +735,7 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
 
     // Partial repay: allows paying interest + late fees first, then principal reduction.
     // msg.value is applied: interest + lateFee first, remaining reduces principal.
-    function partialRepay(address borrower) external payable whenRepaymentNotPaused nonReentrant notBlacklisted {
+    function partialRepay(address borrower) external payable whenRepaymentNotPaused nonReentrant notBlacklisted whenNotPaused {
         require(msg.value > 0, "Must send funds");
         Loan storage loan = loans[borrower];
         require(loan.isActive, "No active loan");
@@ -794,6 +825,16 @@ contract EnhancedProjectV8 is ReentrancyGuard, Ownable, Pausable {
     ) {
         Loan memory loan = loans[borrower];
         return (loan.principal, loan.interestAccrued, loan.startTime, loan.isActive);
+    }
+
+    // View: user's reward balance (including pending)
+    function getRewardBalance(address userAddr) external view returns (uint256) {
+        return rewards[userAddr].add(pendingRewards(userAddr));
+    }
+
+    // View: protocol fees available
+    function getProtocolFees() external view returns (uint256) {
+        return ownerFees;
     }
 
     // ---------- Receive / Fallback ----------
