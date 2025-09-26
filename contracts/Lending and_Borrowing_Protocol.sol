@@ -7,14 +7,17 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
 /**
- * EnhancedProjectV8_plus
+ * EnhancedProjectV9
  * - Adds comprehensive risk management & fee handling
  * - Protocol fee on borrow
  * - Partial repayment support
  * - Liquidity ratio requirement for borrows
  * - Late fee handling
+ * - Deposit & borrow limits
+ * - Early repayment discount
+ * - Adjustable parameters
  */
-contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
+contract EnhancedProjectV9 is ReentrancyGuard, Ownable, Pausable {
     using SafeMath for uint256;
 
     struct Loan {
@@ -40,11 +43,16 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
     uint256 public lateFeeRate = 2; // 2% per week
     uint256 public liquidityRatioThreshold = 150; // 150% requirement
 
+    uint256 public maxDepositPerUser = 50 ether;
+    uint256 public maxBorrowPerUser = 20 ether;
+    uint256 public earlyRepaymentDiscountPercent = 1; // 1% discount if repaid early
+
     mapping(address => bool) public blacklisted;
     bool public depositsPaused;
     bool public borrowPaused;
     bool public repaymentPaused;
 
+    // --------- Events ---------
     event Deposited(address indexed user, uint256 amount);
     event Borrowed(address indexed user, uint256 amount, uint256 fee);
     event Repaid(address indexed user, uint256 amount);
@@ -53,7 +61,9 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
     event OwnerWithdrawal(uint256 amount);
     event Blacklisted(address indexed user, bool status);
     event PausedAction(string action, bool status);
+    event LiquidityRatioTooLow(address indexed user, uint256 currentRatio, uint256 requestedAmount);
 
+    // --------- Modifiers ---------
     modifier notBlacklisted() {
         require(!blacklisted[msg.sender], "Blacklisted");
         _;
@@ -71,6 +81,16 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
 
     modifier whenRepaymentNotPaused() {
         require(!repaymentPaused, "Repayment paused");
+        _;
+    }
+
+    modifier withinDepositLimit(uint256 amount) {
+        require(users[msg.sender].deposited.add(amount) <= maxDepositPerUser, "Exceeds max deposit");
+        _;
+    }
+
+    modifier withinBorrowLimit(uint256 amount) {
+        require(users[msg.sender].borrowed.add(amount) <= maxBorrowPerUser, "Exceeds max borrow");
         _;
     }
 
@@ -103,8 +123,37 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
         _unpause();
     }
 
+    // Adjustable parameters
+    function setBaseInterestRate(uint256 rate) external onlyOwner {
+        baseInterestRate = rate;
+    }
+
+    function setProtocolFeePercent(uint256 fee) external onlyOwner {
+        protocolFeePercent = fee;
+    }
+
+    function setLateFeeRate(uint256 fee) external onlyOwner {
+        lateFeeRate = fee;
+    }
+
+    function setLiquidityRatioThreshold(uint256 ratio) external onlyOwner {
+        liquidityRatioThreshold = ratio;
+    }
+
+    function setMaxDepositPerUser(uint256 amount) external onlyOwner {
+        maxDepositPerUser = amount;
+    }
+
+    function setMaxBorrowPerUser(uint256 amount) external onlyOwner {
+        maxBorrowPerUser = amount;
+    }
+
+    function setEarlyRepaymentDiscountPercent(uint256 percent) external onlyOwner {
+        earlyRepaymentDiscountPercent = percent;
+    }
+
     // --------- Core Functions ---------
-    function deposit() external payable whenDepositsNotPaused nonReentrant notBlacklisted whenNotPaused {
+    function deposit() external payable whenDepositsNotPaused nonReentrant notBlacklisted whenNotPaused withinDepositLimit(msg.value) {
         require(msg.value > 0, "Must deposit >0");
         users[msg.sender].deposited = users[msg.sender].deposited.add(msg.value);
         totalDeposits = totalDeposits.add(msg.value);
@@ -121,12 +170,15 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
         return baseInterestRate.add(utilization.div(10)); // scale with utilization
     }
 
-    function borrow(uint256 amount) external whenBorrowNotPaused nonReentrant notBlacklisted whenNotPaused {
+    function borrow(uint256 amount) external whenBorrowNotPaused nonReentrant notBlacklisted whenNotPaused withinBorrowLimit(amount) {
         require(amount > 0, "Invalid borrow amount");
 
         // Liquidity check
         uint256 liquidityRatio = totalDeposits.mul(100).div(totalBorrowed.add(amount));
-        require(liquidityRatio >= liquidityRatioThreshold, "Liquidity ratio too low");
+        if (liquidityRatio < liquidityRatioThreshold) {
+            emit LiquidityRatioTooLow(msg.sender, liquidityRatio, amount);
+            revert("Liquidity ratio too low");
+        }
 
         uint256 fee = amount.mul(protocolFeePercent).div(100);
         uint256 amountAfterFee = amount.sub(fee);
@@ -158,6 +210,18 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
         return loan.principal.mul(lateFeeRate).mul(overdueWeeks).div(100);
     }
 
+    function updateInterest(address borrower) public {
+        Loan storage loan = loans[borrower];
+        require(loan.isActive, "No active loan");
+
+        uint256 elapsed = block.timestamp.sub(loan.startTime);
+        uint256 rate = getCurrentInterestRate();
+        uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
+
+        loan.interestAccrued = loan.interestAccrued.add(interest);
+        loan.startTime = block.timestamp;
+    }
+
     function repay() external payable whenRepaymentNotPaused nonReentrant notBlacklisted whenNotPaused {
         Loan storage loan = loans[msg.sender];
         require(loan.isActive, "No active loan");
@@ -167,6 +231,11 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
         uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
         uint256 lateFee = calculateLateFee(msg.sender);
         uint256 totalOwed = loan.principal.add(interest).add(lateFee);
+
+        // Early repayment discount
+        if (elapsed <= 15 days) {
+            totalOwed = totalOwed.mul(uint256(100).sub(earlyRepaymentDiscountPercent)).div(100);
+        }
 
         require(msg.value >= totalOwed, "Insufficient repay");
 
@@ -183,31 +252,21 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
         emit Repaid(msg.sender, totalOwed);
     }
 
-    function partialRepay(address borrower) 
-        external 
-        payable 
-        whenRepaymentNotPaused 
-        nonReentrant 
-        notBlacklisted 
-        whenNotPaused 
-    {
+    function partialRepay(address borrower) external payable whenRepaymentNotPaused nonReentrant notBlacklisted whenNotPaused {
         require(msg.value > 0, "Must send funds");
         Loan storage loan = loans[borrower];
         require(loan.isActive, "No active loan");
 
-        uint256 elapsed = block.timestamp.sub(loan.startTime);
-        uint256 rate = getCurrentInterestRate();
-        uint256 interest = loan.principal.mul(rate).mul(elapsed).div(365 days).div(100);
-        uint256 lateFee = calculateLateFee(borrower);
-        uint256 totalInterestAndFees = interest.add(lateFee);
+        updateInterest(borrower); // ensure interestAccrued is updated
 
         uint256 remaining = msg.value;
 
-        // Step 1: Pay interest + fees first
+        // Step 1: Pay accrued interest + fees first
+        uint256 totalInterestAndFees = loan.interestAccrued.add(calculateLateFee(borrower));
         if (remaining >= totalInterestAndFees) {
             remaining = remaining.sub(totalInterestAndFees);
             loan.interestAccrued = 0;
-            loan.startTime = block.timestamp; // reset accrual
+            loan.startTime = block.timestamp;
         } else {
             if (loan.interestAccrued >= remaining) {
                 loan.interestAccrued = loan.interestAccrued.sub(remaining);
@@ -280,5 +339,13 @@ contract EnhancedProjectV8_plus is ReentrancyGuard, Ownable, Pausable {
         uint256 lateFee = calculateLateFee(borrower);
 
         return loan.principal.add(interest).add(lateFee);
+    }
+
+    function getLoanSummary(address borrower) external view returns (uint256 principal, uint256 interestAccrued, uint256 lateFee, bool isActive) {
+        Loan storage loan = loans[borrower];
+        principal = loan.principal;
+        interestAccrued = loan.interestAccrued;
+        lateFee = calculateLateFee(borrower);
+        isActive = loan.isActive;
     }
 }
