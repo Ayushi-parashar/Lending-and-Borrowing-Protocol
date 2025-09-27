@@ -94,7 +94,7 @@ contract EnhancedProjectV9 is ReentrancyGuard, Ownable, Pausable {
         _;
     }
 
-    // --------- Admin Controls ---------
+    // --------- Admin Controls -----
     function setBlacklist(address user, bool status) external onlyOwner {
         blacklisted[user] = status;
         emit Blacklisted(user, status);
@@ -349,3 +349,4 @@ contract EnhancedProjectV9 is ReentrancyGuard, Ownable, Pausable {
         isActive = loan.isActive;
     }
 }
+
